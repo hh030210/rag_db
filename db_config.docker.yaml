@@ -1,0 +1,59 @@
+# 数据库配置文件 (Docker 镜像内使用)
+# MySQL 和 Milvus 服务已内置在容器中
+
+# 关系型数据库配置 (MySQL)
+rdb:
+  type: mysql
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: "${MYSQL_ROOT_PASSWORD:-root}"
+  database: "${MYSQL_DATABASE:-Main_index}"
+  table: MainIndex
+  doc_id_column: Doc_ID
+  corpus_id_column: corpus_id
+  updated_at_column: updated_at
+  profile_column: profile_json
+
+# 向量数据库配置 (Milvus Lite 嵌入式)
+vecdb:
+  type: milvus
+  uri: "${MILVUS_DATA:-/milvus_data}/milvus_lite.db"
+  collection_name: "${MILVUS_COLLECTION:-test_collection}"
+  vector_dim: 1024
+  index_type: IVF_FLAT
+  metric_type: L2
+  nlist: 1024
+  nprobe: 128
+
+# Embedding 模型配置
+embedding:
+  model_name: bge-m3
+  model_path: "${MODEL_PATH:-/models}/bge-m3"
+  batch_size: 64
+  device: auto
+  normalize_embeddings: true
+
+# API 配置
+api:
+  rdb_api_base: http://127.0.0.1:8000
+  http_timeout: 60
+
+# LLM 配置 (云服务，无需修改)
+llm:
+  api_key: "${LLM_API_KEY:-}"
+  base_url: "${LLM_BASE_URL:-https://api.siliconflow.cn/v1}"
+  model: "${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+  timeout: 60
+  title_gen_batch_size: 5
+  title_gen_batch_delay: 1
+
+# 问题生成配置 (DashScope)
+qgen:
+  api_key: "${DASHSCOPE_API_KEY:-}"
+  model: qwen-plus
+  base_url: https://dashscope.aliyuncs.com/api/v1
+  timeout: 60
+  max_retries: 3
+  retry_delay: 2
+  delay_between_calls: 0.5

@@ -1,0 +1,77 @@
+version: "3.8"
+
+# 检索后端服务（Qdrant + Search API + Loader）
+
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: rag-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - /mnt/qdrant_storage:/qdrant/storage
+      - ./qdrant_config.yaml:/qdrant/config/config.yaml:ro
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    ulimits:
+      memlock: -1
+    # 不设 docker-level healthcheck（容器内可能没 curl/wget）
+    # 用外部脚本拉取 /healthz 来检测
+
+  loader:
+    profiles: ["init"]
+    image: python:3.11-slim
+    container_name: rag-loader
+    working_dir: /app
+    volumes:
+      - ./loader:/app
+      - /opt/search_service/data:/data:ro
+      - /opt/search_service/models:/models:ro
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      BGE_MODEL_PATH: /models/bge-m3
+    command: ["python", "load_qdrant.py"]
+    entrypoint: ["/bin/bash", "-c"]
+    # 完整启动在外部脚本（先 apt+pip）
+
+  search:
+    image: python:3.11-slim
+    container_name: rag-search
+    restart: unless-stopped
+    # 不依赖 docker-level health
+    ports:
+      - "8100:8100"
+    volumes:
+      - /opt/search_service/service:/app
+      - /opt/search_service/models:/models:ro
+    working_dir: /app
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8100"
+      QDRANT_HOST: "qdrant"
+      QDRANT_PORT: "6333"
+      CHUNK_COLLECTION: "unified_corpus"
+      DIM_TAGS_COLLECTION: "dimension_tags"
+      VECTOR_DIM: "1024"
+      BGE_MODEL_PATH: "/models/bge-m3"
+      BGE_DEVICE: "cpu"
+      BGE_USE_FP16: "0"
+      DIM_RECALL_METHOD: "tag"
+      DIM_RERANK_METHOD: "tag_sim"
+      DIM_INTERNAL_FUSION: "score"
+      DEFAULT_TOP_K: "8"
+      FUSION_STRATEGY: "rrf"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+    command:
+      - /bin/bash
+      - -c
+      - |
+        apt-get update && apt-get install -y --no-install-recommends gcc g++ curl \
+          && pip install --no-cache-dir -r /app/requirements.txt \
+          && exec python search_api_server.py

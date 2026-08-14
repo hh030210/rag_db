@@ -1,0 +1,30 @@
+version: '3.5'
+
+services:
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus:
+    container_name: milvus2b-standalone
+    image: milvusdb/milvus:v2.4.3
+    network_mode: host
+    environment:
+      ETCD_ENDPOINTS: localhost:2379
+      MINIO_ADDRESS: localhost:9000
+    volumes:
+      - D:/RAG_DB/milvus2_volumes/milvus:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy

@@ -1,0 +1,121 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Node
+node_modules/
+package-lock.json
+
+# Cache
+cache/
+*.log
+
+# Output (regeneratable)
+output_chunks/
+output_chunks_unified/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large data files (optional - check if needed)
+*.db
+*.sqlite
+
+# Large model files (download separately)
+model/
+code1/models/
+code1_lyj/models/
+
+# Local datasets, embeddings, vector stores, and generated experiment data
+data_input/
+experiment_data/
+experiment_results/
+fusion_results/
+output_chunks/
+output_chunks_unified/
+output_no_ingest/
+search_service_deploy/data/
+code1_lyj/chapter2/datas/
+code1_lyj/chapter2/experiments/
+code1_lyj/chapter3/datasets/
+code1_lyj/chapter3/codes/bylw_rag/experiments/
+code1_lyj/chapter3/codes/bylw_rag/new_experiments/
+code1_lyj/chapter3/codes/bylw_rag/new_experiments_20260409/
+code1_lyj/chapter3/codes/bylw_rag/datas/
+code1_lyj/chapter3/codes/bylw_rag/llm_logs/
+code1_lyj/chapter3/codes/naive_rag/vector_dbs/
+code1_lyj/chapter3/codes/naive_rag/experiments/
+code1_lyj/chapter3/codes/naive_rag/llm_logs/
+code1_lyj/chapter3/codes/evaluation/llm_judge_results/
+code1_lyj/chapter3_backup/
+code1_lyj/chapter4/chroma_db/
+code1_lyj/chapter4/logs/
+code1_lyj/chapter4/outputs/
+code1_lyj/chapter4/uploads/
+code1_lyj/chapter4/rag_data/
+code1_lyj/chapter4_new/chroma_db/
+code1_lyj/chapter4_new/logs/
+code1_lyj/chapter4_new/outputs/
+code1_lyj/chapter4_new/uploads/
+code1_lyj/chapter4_new/rag_data/
+code1_lyj/chapter4_upgrade/chroma_db/
+code1_lyj/chapter4_upgrade/logs/
+code1_lyj/chapter4_upgrade/outputs/
+code1_lyj/chapter4_upgrade/uploads/
+code1_lyj/chapter4_upgrade/rag_data/
+code1_lyj/chapter4_xxx/chroma_db/
+code1_lyj/chapter4_xxx/logs/
+code1_lyj/chapter4_xxx/outputs/
+code1_lyj/chapter4_xxx/uploads/
+code1_lyj/chapter4_xxx/rag_data/
+*.faiss
+*.pkl
+*.parquet
+*.bin
+*.onnx
+*.safetensors
+*.pdf
+*.sqlite3
+*.zip
+*.tar.gz
+*.docx
+*.xlsx
+*.xls
+*.pptx
+*.ppt
+merged_*_rag_test_set.json
+code1_lyj/chapter2/conversion_log.txt
+code1_lyj/chapter3/codes/naive_rag/results/
+code1_lyj/chapter4/file_metadata.json
+code1_lyj/chapter4_new/file_metadata.json
+code1_lyj/chapter4_upgrade/file_metadata.json
+code1_lyj/chapter4_xxx/file_metadata.json
+_*.txt
+_*.json
+*_out.txt
+server_log.txt
+pack_log.txt
+
+# Local credentials and certificates
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.secret
+_upload_prompt_opt.py
+search_service_deploy/scripts/_*
+search_service_deploy/scripts/migrate_final.py
+
+# Local editor/session metadata
+.specstory/
+.cursorindexingignore

@@ -1,0 +1,71 @@
+# 数据库配置文件
+# 复制 db_config.example.yaml 并重命名为 db_config.yaml
+
+# 关系型数据库配置
+rdb:
+  type: mysql
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: "${MYSQL_ROOT_PASSWORD:-}"
+  database: Main_index
+  table: MainIndex
+  doc_id_column: Doc_ID
+  corpus_id_column: corpus_id
+  updated_at_column: updated_at
+  profile_column: profile_json
+
+# 向量数据库配置 - Qdrant
+vecdb:
+  type: qdrant
+  host: 127.0.0.1
+  port: 6333
+  grpc_port: 6334
+  collection_name: unified_corpus
+  vector_dim: 1024
+  distance: Cosine
+
+# 向量数据库配置 - Qdrant 扩展配置（dim_tags 等）
+vecdb_qdrant:
+  type: qdrant
+  host: 127.0.0.1
+  port: 6333
+  grpc_port: 6334
+  collection_name: unified_corpus
+  dim_tags_collection: dimension_tags
+  vector_dim: 1024
+  hnsw_ef_construct: 512
+  hnsw_m: 16
+  distance: Cosine
+
+# Embedding 模型配置
+embedding:
+  model_name: bge-m3
+  model_path: ${MODEL_PATH:-/models}/bge-m3
+  batch_size: 64
+  device: auto
+  normalize_embeddings: true
+
+# API 配置
+api:
+  rdb_api_base: http://127.0.0.1:8000
+  http_timeout: 60
+
+# LLM 配置
+llm:
+  api_key: "${LLM_API_KEY:-}"
+  base_url: https://api.siliconflow.cn/v1
+  model: Qwen/Qwen2.5-7B-Instruct
+  timeout: 60
+  title_gen_batch_size: 5
+  title_gen_batch_delay: 1
+
+# 问题生成（DashScope Qwen Plus）配置
+qgen:
+  api_key: "${DASHSCOPE_API_KEY:-}"
+  model: qwen-plus
+  base_url: https://dashscope.aliyuncs.com/api/v1
+  timeout: 60
+  max_retries: 3
+  retry_delay: 2
+  delay_between_calls: 0.5

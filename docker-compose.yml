@@ -1,0 +1,27 @@
+# docker-compose.yml
+# ============================
+# RAG Pipeline - 加入现有 Docker 网络
+# 与 rag_milvus、rag_mysql 等容器在同一网络通信
+
+services:
+  rag-pipeline:
+    build: .
+    container_name: rag-pipeline
+    restart: unless-stopped
+
+    # 加入现有容器网络（需要指定外部网络名）
+    networks:
+      - rag_default
+
+    environment:
+      # LLM (可选)
+      # LLM_API_KEY: your_api_key
+      # DASHSCOPE_API_KEY: your_dashscope_key
+
+    volumes:
+      # 配置文件
+      - ./db_config.yaml:/app/db_config.yaml
+
+networks:
+  mingqiang_rag_net:
+    external: true

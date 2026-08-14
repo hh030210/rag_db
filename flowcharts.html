@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG DB Slim 系统全流程</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --blue: #2563eb;
+      --blue-light: #eff6ff;
+      --green: #16a34a;
+      --green-light: #f0fdf4;
+      --purple: #7c3aed;
+      --purple-light: #f5f3ff;
+      --orange: #ea580c;
+      --orange-light: #fff7ed;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      padding: 32px 40px;
+      max-width: 1300px;
+      margin: 0 auto;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 36px;
+    }
+    .header h1 {
+      font-size: 30px;
+      font-weight: 800;
+      color: var(--text);
+      margin-bottom: 8px;
+      letter-spacing: -0.5px;
+    }
+    .header p {
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* ── Top pipeline flow ── */
+    .pipeline-flow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0;
+      margin-bottom: 60px;
+      overflow-x: auto;
+      padding: 8px 0;
+    }
+    .pf-step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-width: 150px;
+      height: 90px;
+      border-radius: 18px;
+      text-decoration: none;
+      font-weight: 700;
+      transition: all 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+      cursor: pointer;
+      border: 2.5px solid transparent;
+      position: relative;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .pf-step::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 5px;
+      border-radius: 18px 18px 0 0;
+    }
+    .pf-step.blue::before   { background: var(--blue); }
+    .pf-step.green::before  { background: var(--green); }
+    .pf-step.purple::before { background: var(--purple); }
+
+    .pf-step .num {
+      font-size: 28px;
+      font-weight: 900;
+      line-height: 1;
+      margin-bottom: 5px;
+      letter-spacing: -1px;
+    }
+    .pf-step .label {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.3;
+      text-align: center;
+      padding: 0 8px;
+    }
+    .pf-step .sub {
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--text-muted);
+      margin-top: 2px;
+      opacity: 0.8;
+    }
+
+    .pf-step.blue {
+      background: linear-gradient(160deg, #ffffff 55%, var(--blue-light) 100%);
+      border-color: #bfdbfe;
+      color: var(--blue);
+    }
+    .pf-step.green {
+      background: linear-gradient(160deg, #ffffff 55%, var(--green-light) 100%);
+      border-color: #bbf7d0;
+      color: var(--green);
+    }
+    .pf-step.purple {
+      background: linear-gradient(160deg, #ffffff 55%, var(--purple-light) 100%);
+      border-color: #ddd6fe;
+      color: var(--purple);
+    }
+
+    .pf-step:hover {
+      transform: translateY(-7px) scale(1.05);
+      box-shadow: 0 14px 36px rgba(0,0,0,0.15);
+    }
+    .pf-step.blue:hover   { border-color: var(--blue);   background: linear-gradient(160deg, var(--blue-light) 0%, #dbeafe 100%); }
+    .pf-step.green:hover  { border-color: var(--green);   background: linear-gradient(160deg, var(--green-light) 0%, #dcfce7 100%); }
+    .pf-step.purple:hover { border-color: var(--purple);  background: linear-gradient(160deg, var(--purple-light) 0%, #ede9fe 100%); }
+
+    .pf-arrow {
+      flex-shrink: 0;
+      user-select: none;
+      padding: 0 4px;
+    }
+    .pf-arrow svg {
+      width: 36px;
+      height: 36px;
+      fill: none;
+      stroke-width: 2.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .pf-arrow.blue   svg { stroke: var(--blue); }
+    .pf-arrow.green  svg { stroke: var(--green); }
+    .pf-arrow.purple svg { stroke: var(--purple); }
+    .pf-arrow.neutral svg { stroke: #94a3b8; }
+
+    /* ── Sections ── */
+    section { margin-bottom: 56px; }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .section-num {
+      width: 38px; height: 38px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 17px; font-weight: 800; flex-shrink: 0;
+      color: #fff;
+    }
+    .section-num.blue   { background: var(--blue); }
+    .section-num.green  { background: var(--green); }
+    .section-num.purple { background: var(--purple); }
+
+    .section-title { font-size: 20px; font-weight: 700; }
+    .section-title.blue   { color: var(--blue); }
+    .section-title.green  { color: var(--green); }
+    .section-title.purple { color: var(--purple); }
+    .section-subtitle {
+      color: var(--text-muted);
+      font-size: 13px;
+      margin: -6px 0 14px 50px;
+    }
+
+    .diagram-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 20px 8px;
+      overflow-x: auto;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+
+    .legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .legend-item { display: flex; align-items: center; gap: 5px; }
+    .legend-dot {
+      width: 12px; height: 12px;
+      border-radius: 3px;
+      border: 1.5px solid;
+      flex-shrink: 0;
+    }
+
+    pre.mermaid {
+      font-size: 13px;
+      min-width: 600px;
+    }
+
+    .footer {
+      text-align: center;
+      font-size: 12px;
+      color: #94a3b8;
+      padding: 24px;
+      border-top: 1px solid var(--border);
+    }
+
+    @media (max-width: 600px) {
+      body { padding: 16px; }
+      pre.mermaid { min-width: 100%; font-size: 11px; }
+      .pipeline-flow { flex-wrap: wrap; gap: 8px; }
+      .pf-arrow { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>RAG DB Slim 系统全流程</h1>
+  <p>pipeline_qdrant.py &middot; query_expander.py &middot; interactive_qa.py</p>
+</div>
+
+<!-- ── Top pipeline flow ── -->
+<div class="pipeline-flow">
+  <a class="pf-step blue" href="#s1">
+    <span class="num">1</span>
+    <span class="label">文件分片</span>
+    <span class="sub">chunk + 指代消解</span>
+  </a>
+  <span class="pf-arrow blue"><svg viewBox="0 0 36 36"><path d="M8 18h16M22 12l6 6-6 6"/></svg></span>
+
+  <a class="pf-step purple" href="#s2">
+    <span class="num">2</span>
+    <span class="label">维度抽取</span>
+    <span class="sub">挖掘 → 融合 → 打标</span>
+  </a>
+  <span class="pf-arrow purple"><svg viewBox="0 0 36 36"><path d="M8 18h16M22 12l6 6-6 6"/></svg></span>
+
+  <a class="pf-step blue" href="#s3">
+    <span class="num">3</span>
+    <span class="label">数据入库</span>
+    <span class="sub">MySQL 写入</span>
+  </a>
+
+  <a class="pf-step green" href="#s4">
+    <span class="num">4</span>
+    <span class="label">Query 扩展</span>
+    <span class="sub">子查询 + 实体</span>
+  </a>
+  <span class="pf-arrow green"><svg viewBox="0 0 36 36"><path d="M8 18h16M22 12l6 6-6 6"/></svg></span>
+
+  <a class="pf-step blue" href="#s5">
+    <span class="num">5</span>
+    <span class="label">多路检索</span>
+    <span class="sub">语义 × 维度 融合</span>
+  </a>
+  <span class="pf-arrow blue"><svg viewBox="0 0 36 36"><path d="M8 18h16M22 12l6 6-6 6"/></svg></span>
+
+  <a class="pf-step green" href="#s6">
+    <span class="num">6</span>
+    <span class="label">Prompt 优化</span>
+    <span class="sub">cluster 路由 + 融合</span>
+  </a>
+</div>
+
+
+<!-- SECTION 1: 文件分片（简化逻辑） -->
+<section id="s1">
+  <div class="section-header">
+    <div class="section-num blue">1</div>
+    <h2 class="section-title blue">文件分片</h2>
+  </div>
+  <p class="section-subtitle">Step 2 &rarr; Step 3：文件切块 + 指代消解，输出统一 chunks</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#dcfce7;border-color:#86efac"></div>开始/结束</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eff6ff;border-color:#93c5fd"></div>处理步骤</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffedd5;border-color:#fdba74"></div>LLM / 外部工具</div>
+  </div>
+
+  <div class="diagram-wrap">
+<pre class="mermaid">
+flowchart LR
+    subgraph "Step 2: 分片"
+        A1(["原始文档<br/>input_path"]) --> A2["integrated_chunker<br/>按章节/段落切块"]
+        A2 --> A3["指代消解 coreference<br/>规则引擎 / LLM 模式"]
+        A3 --> A4(["统一 chunks<br/>all_chunks_resolved.json"])
+    end
+
+    A4 --> B1(["进入 Step 4<br/>写入 MySQL"])
+
+    classDef se fill:#dcfce7,stroke:#86efac,color:#15803d
+    classDef pr fill:#eff6ff,stroke:#93c5fd,color:#1d4ed8
+    classDef ll fill:#ffedd5,stroke:#fdba74,color:#c2410c
+
+    class A1,A4 se
+    class A2,A3 pr
+    class A3 ll
+</pre>
+  </div>
+</section>
+
+
+<!-- SECTION 2: 维度抽取（重点，含融合） -->
+<section id="s2">
+  <div class="section-header">
+    <div class="section-num green">2</div>
+    <h2 class="section-title green">维度抽取 &amp; 融合</h2>
+  </div>
+  <p class="section-subtitle">Step 5：聚类采样 &rarr; LLM 归纳候选维度 &rarr; 迭代优化 &rarr; 维度融合 &rarr; 批量打标 &rarr; 回写 MySQL</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#dcfce7;border-color:#86efac"></div>开始/结束</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eff6ff;border-color:#93c5fd"></div>处理步骤</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fef9c3;border-color:#fde047"></div>分支判断</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffedd5;border-color:#fdba74"></div>LLM 调用</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f1f5f9;border-color:#cbd5e1"></div>数据存储</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f5f3ff;border-color:#c4b5fd"></div>维度融合</div>
+  </div>
+
+  <div class="diagram-wrap">
+<pre class="mermaid">
+flowchart TD
+    Start([step5_dimension_tagging<br/>reset_cache 可选])
+
+    Start --> Cache{reset_cache<br/>== True?}
+    Cache -- 是 --> Clear["清空 experiment_data/<br/>V_cand / V_core / tags_output"]
+    Clear --> LoadLLM
+    Cache -- 否 --> LoadLLM
+
+    LoadLLM["加载 llm_service"] --> FiveA
+
+    subgraph "5a 维度挖掘"
+        direction LR
+        FiveA --> C1["5a-1 聚类采样<br/>BGE 向量化 + K-Means<br/>DimensionMiner"]
+        C1 --> C2["5a-2 LLM 归纳候选维度<br/>step2_generate_candidates<br/>→ V_cand ≈ 15 个"]
+        C2 --> C3["5a-3 迭代优化<br/>step3_iterative_optimization<br/>覆盖率反馈循环<br/>→ V_core ≈ 8 个核心维度"]
+        C3 --> VC["V_cand.json<br/>V_core.json"]
+    end
+
+    VC --> FiveB
+    FiveB["5b 动态添加 MySQL 列<br/>ALTER TABLE ADD dim_xxx"] --> FiveC
+
+    subgraph "5c 维度融合"
+        direction LR
+        FiveC --> Fuse["加载 V_cand / V_core<br/>构建融合映射表<br/>dim_name → canonical_name"]
+        Fuse --> Merge["合并相似维度<br/>LLM 判断近义维度<br/>→ 最终维度列表"]
+        Merge --> TagMap["生成 tags_output<br/>每 chunk 对应维度标签"]
+        TagMap --> DumpT["dump tags_output_*.json"]
+    end
+
+    DumpT --> FiveD
+    FiveD["5d 回写 MySQL<br/>UPDATE dim_xxx WHERE doc_id"] --> Clean["清理空列<br/>DROP 全为 NULL 的列"]
+    Clean --> End5(["维度抽取完成<br/>dims / tags_count"])
+
+    classDef se fill:#dcfce7,stroke:#86efac,color:#15803d
+    classDef pr fill:#eff6ff,stroke:#93c5fd,color:#1d4ed8
+    classDef br fill:#fef9c3,stroke:#fde047,color:#713f12
+    classDef ll fill:#ffedd5,stroke:#fdba74,color:#c2410c
+    classDef io fill:#f1f5f9,stroke:#cbd5e1,color:#475569
+    classDef fu fill:#f5f3ff,stroke:#c4b5fd,color:#6d28d9
+
+    class Start,VC,DumpT,End5 se
+    class FiveA,FiveB,FiveC,FiveD,Cache,LoadLLM,Clear,C1,C2,C3 pr
+    class Cache,Merge br
+    class C2,C3 ll
+    class VC,DumpT,TagMap io
+    class Fuse,Merge fu
+</pre>
+  </div>
+</section>
+
+
+<!-- SECTION 3: 数据入库（简化） -->
+<section id="s3">
+  <div class="section-header">
+    <div class="section-num blue">3</div>
+    <h2 class="section-title blue">数据入库</h2>
+  </div>
+  <p class="section-subtitle">Step 4：chunks 批量写入 MySQL MainIndex 表</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#dcfce7;border-color:#86efac"></div>开始/结束</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eff6ff;border-color:#93c5fd"></div>处理步骤</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fef9c3;border-color:#fde047"></div>分支判断</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f1f5f9;border-color:#cbd5e1"></div>数据存储</div>
+  </div>
+
+  <div class="diagram-wrap">
+<pre class="mermaid">
+flowchart LR
+    subgraph "Step 4: 写入 MySQL"
+        S4(["chunks 已就绪<br/>all_chunks_resolved.json"]) --> T1["force? → 重建表<br/>否则 → 增量写入"]
+        T1 --> T2["逐 chunk 构造 INSERT<br/>doc_id / corpus_id / doc_text<br/>genre / l_min / l_max"]
+        T2 --> T3["ON DUPLICATE KEY UPDATE"]
+        T3 --> T4(["MainIndex 表写入完成<br/>inserted / updated 统计"])
+    end
+
+    T4 --> E5(["进入 Step 5<br/>维度抽取"])
+
+    classDef se fill:#dcfce7,stroke:#86efac,color:#15803d
+    classDef pr fill:#eff6ff,stroke:#93c5fd,color:#1d4ed8
+    classDef br fill:#fef9c3,stroke:#fde047,color:#713f12
+    classDef io fill:#f1f5f9,stroke:#cbd5e1,color:#475569
+
+    class S4,T4 se
+    class T1,T2,T3 pr
+    class T1 br
+    class T3 io
+</pre>
+  </div>
+</section>
+
+
+<!-- SECTION 4: Query 扩展 -->
+<section id="s4">
+  <div class="section-header">
+    <div class="section-num green">4</div>
+    <h2 class="section-title green">Query 扩展</h2>
+  </div>
+  <p class="section-subtitle">QueryExpander.expand：子查询 + 实体抽取 + 聚类匹配，输出多路检索 query</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#dcfce7;border-color:#86efac"></div>开始/结束</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eff6ff;border-color:#93c5fd"></div>处理步骤</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fef9c3;border-color:#fde047"></div>分支判断</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffedd5;border-color:#fdba74"></div>LLM / BGE</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f5f3ff;border-color:#c4b5fd"></div>聚类匹配</div>
+  </div>
+
+  <div class="diagram-wrap">
+<pre class="mermaid">
+flowchart TD
+    QE(["用户 Query"])
+
+    QE --> L1{"use_llm_subqueries?"}
+    L1 -- 关 --> Q1["直接作为单一 query"]
+    L1 -- 开 --> CkCache{缓存命中?}
+    CkCache -- 命中 --> UseC["取缓存 sub_queries"]
+    CkCache -- 未命中 --> LLM1["LLM 生成子查询<br/>qwen-plus temp=0.3"]
+    UseC --> L2
+    LLM1 --> Parse["解析 / 过滤<br/>5~120 字子查询"]
+    Parse --> HasL{至少 1 条?}
+    HasL -- 否 --> Q1
+    HasL -- 是 --> L2
+
+    L2["Layer 2: 实体术语抽取<br/>extract_entity_terms"] --> LLM2["LLM qwen-plus<br/>temperature=0.1"]
+    LLM2 --> Pipe["按竖线 split<br/>取前 10 个 entity_terms"]
+    Pipe --> L3
+
+    L3{"use_cluster_prompt?"}
+    L3 -- 关 --> EmptyC["top_clusters = []"]
+    L3 -- 开 --> BGE["BGE encode(query)<br/>→ q_emb"]
+    BGE --> Cos["cosine_sim(q_emb, cluster_centers)"]
+    Cos --> Sort["降序排列<br/>取 Top-2 cluster"]
+    Sort --> Top2["cluster_id + similarity<br/>→ top_prompts"]
+    Top2 --> DoneL3
+    EmptyC --> DoneL3
+
+    DoneL3["Layer 3 完成<br/>top_clusters / top_prompts"] --> Fuse["build_fusion_query<br/>子查询用竖线拼接<br/>→ fusion_query"]
+    Fuse --> Out["expand_result<br/>sub_queries / entity_terms<br/>top_clusters / top_prompts<br/>fusion_query"]
+    Out --> ToSearch["fusion_query → do_search<br/>原始 query → do_qa"]
+
+    classDef se fill:#dcfce7,stroke:#86efac,color:#15803d
+    classDef pr fill:#eff6ff,stroke:#93c5fd,color:#1d4ed8
+    classDef br fill:#fef9c3,stroke:#fde047,color:#713f12
+    classDef ll fill:#ffedd5,stroke:#fdba74,color:#c2410c
+    classDef fu fill:#f5f3ff,stroke:#c4b5fd,color:#6d28d9
+
+    class QE,Q1,UseC,EmptyC,Pipe,Top2,DoneL3,Fuse,Out,ToSearch se
+    class L1,CkCache,HasL,L3 pr
+    class L2,BGE,Cos,Sort br
+    class LLM1,LLM2 ll
+</pre>
+  </div>
+</section>
+
+
+<!-- SECTION 5: 多路检索 -->
+<section id="s5">
+  <div class="section-header">
+    <div class="section-num purple">5</div>
+    <h2 class="section-title purple">多路检索</h2>
+  </div>
+  <p class="section-subtitle">do_search：语义向量 × 维度约束 两路并行 → 融合排序 → top_chunks</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#dcfce7;border-color:#86efac"></div>开始/结束</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eff6ff;border-color:#93c5fd"></div>处理步骤</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fef9c3;border-color:#fde047"></div>分支判断</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffedd5;border-color:#fdba74"></div>向量/BGE 检索</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f5f3ff;border-color:#c4b5fd"></div>融合层</div>
+  </div>
+
+  <div class="diagram-wrap">
+<pre class="mermaid">
+flowchart TD
+    Search(["do_search<br/>fusion_query"])
+
+    Search --> Mode{"RETRIEVAL_MODE"}
+
+    subgraph "语义检索路"
+        Mode -- fusion --> Par["两路并行"]
+        Mode -- sem --> S1["BGE encode(query)"]
+        Par --> SemE["BGE encode(fusion_query)"]
+        SemE --> SemS["SemanticSearcher<br/>Top-K 向量检索"]
+        S1 --> SemS
+        SemS --> SemR["sem_results<br/>doc_id + score"]
+    end
+
+    subgraph "维度检索路"
+        Par --> DimE["LLM 提取维度约束<br/>dim_constraints"]
+        DimE --> DimS["DimensionSearcher<br/>α 加权维度匹配"]
+        DimS --> DimR["dim_results<br/>doc_id + dim_score"]
+    end
+
+    SemR --> Fuse{"RERANK_MODE?"}
+    DimR --> Fuse
+
+    subgraph "融合排序"
+        Fuse -- score --> Sc["α·dim_rank + β·sem_rank<br/>综合分数降序 Top-K"]
+        Fuse -- interleaved --> Ir["交替选取 dim/sem<br/>去重后填满 K"]
+    end
+
+    Sc --> Out["top_chunks<br/>前 500 字拼接 context"]
+    Ir --> Out
+
+    Out --> CheckQA{"ENABLE_QA?"}
+    CheckQA -- 否 --> Print["打印检索结果<br/>→ 返回主循环"]
+    CheckQA -- 是 --> BuildC["拼接 context<br/>title / 来源"] --> RetQ(["送入 do_qa"])
+
+    classDef se fill:#dcfce7,stroke:#86efac,color:#15803d
+    classDef pr fill:#eff6ff,stroke:#93c5fd,color:#1d4ed8
+    classDef br fill:#fef9c3,stroke:#fde047,color:#713f12
+    classDef ll fill:#ffedd5,stroke:#fdba74,color:#c2410c
+    classDef fu fill:#f5f3ff,stroke:#c4b5fd,color:#6d28d9
+
+    class Search,Out,CheckQA,Print,BuildC,RetQ se
+    class Mode,Par,SemE,SemS,SemR,DimE,DimS,DimR,Fuse,Sc,Ir pr
+    class Mode,CheckQA br
+    class SemS,DimS,DimE ll
+</pre>
+  </div>
+</section>
+
+
+<!-- SECTION 6: Prompt 优化 -->
+<section id="s6">
+  <div class="section-header">
+    <div class="section-num green">6</div>
+    <h2 class="section-title green">Prompt 优化 &amp; 问答生成</h2>
+  </div>
+  <p class="section-subtitle">do_qa：cluster 路由 → 多 Prompt 并行 → 答案融合 → 最终回答</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#dcfce7;border-color:#86efac"></div>开始/结束</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eff6ff;border-color:#93c5fd"></div>处理步骤</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fef9c3;border-color:#fde047"></div>分支判断</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffedd5;border-color:#fdba74"></div>LLM 调用</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f5f3ff;border-color:#c4b5fd"></div>答案融合</div>
+  </div>
+
+  <div class="diagram-wrap">
+<pre class="mermaid">
+flowchart TD
+    QA(["do_qa<br/>query + chunks + expand_result"])
+
+    QA --> Cnt{top_prompts 数量}
+
+    Cnt -- ≥ 2 --> Multi["多 Prompt 并行调用<br/>各 cluster 对应 PromptModule"]
+    Multi --> CA["LLM A<br/>qwen-plus"]
+    Multi --> CB["LLM B<br/>qwen-plus"]
+    CA --> FuseA{"至少 2 份?"}
+    CB --> FuseA
+    FuseA -- 是 --> FuseL["LLM 答案融合<br/>_fuse_answers temp=0.5"]
+    FuseA -- 仅 1 --> Take1["直接取该答案"]
+    FuseL --> Final
+    Take1 --> Final
+
+    Cnt -- 1 --> One["单 Prompt 构建<br/>PM.build_prompt"]
+    One --> LLM1["LLM qwen-plus<br/>temp=0.1"]
+    LLM1 --> Final
+
+    Cnt -- 0 --> Def["默认通用 Prompt<br/>_build_default_prompt"]
+    Def --> LLM1
+
+    Final["final_answer<br/>最终答案"] --> Print["打印回答<br/>耗时信息"] --> End(["返回主循环<br/>等待下一条"])
+
+    classDef se fill:#dcfce7,stroke:#86efac,color:#15803d
+    classDef pr fill:#eff6ff,stroke:#93c5fd,color:#1d4ed8
+    classDef br fill:#fef9c3,stroke:#fde047,color:#713f12
+    classDef ll fill:#ffedd5,stroke:#fdba74,color:#c2410c
+    classDef fu fill:#f5f3ff,stroke:#c4b5fd,color:#6d28d9
+
+    class QA,Final,Print,End se
+    class Cnt,Multi,FuseA,One,Def pr
+    class CA,CB,LLM1,FuseL br
+    class CA,CB,LLM1,FuseL ll
+</pre>
+  </div>
+</section>
+
+
+<div class="footer">
+  RAG DB Slim &mdash; 系统全流程 &mdash; pipeline_qdrant.py &middot; query_expander.py &middot; interactive_qa.py
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis', padding: 14 },
+    themeVariables: {
+      fontSize: '13px',
+      fontFamily: '-apple-system, "PingFang SC", "Microsoft YaHei", Arial, sans-serif'
+    },
+    securityLevel: 'loose'
+  });
+
+  window.addEventListener('error', function(e) {
+    var div = document.createElement('div');
+    div.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#fee;color:#900;padding:8px;z-index:9999;white-space:pre-wrap;font:12px monospace;border-bottom:2px solid #900';
+    div.textContent = 'JS ERROR: ' + (e.message || e);
+    document.body.appendChild(div);
+  });
+
+  setTimeout(function() {
+    document.querySelectorAll('pre.mermaid').forEach(function(p, i) {
+      if (p.getAttribute('data-processed') !== 'true' && !p.querySelector('svg')) {
+        var d = document.createElement('div');
+        d.style.cssText = 'background:#fee;color:#900;padding:12px;margin:8px 0;border:2px solid #900;font:12px monospace;white-space:pre-wrap;border-radius:6px';
+        d.textContent = '[图 ' + (i+1) + ' 渲染失败]\n' + p.textContent.substring(0, 500);
+        p.parentNode.insertBefore(d, p.nextSibling);
+      }
+    });
+  }, 2000);
+</script>
+
+</body>
+</html>

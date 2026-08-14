@@ -1,0 +1,11 @@
+# search_service 最小依赖
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+httpx>=0.27
+numpy>=1.24
+pyyaml>=6.0
+
+# Embedding（生产建议使用 FlagEmbedding；CPU 部署足够；无 GPU 时 use_fp16=False）
+FlagEmbedding>=1.2
+sentence-transformers>=2.6
