@@ -603,3 +603,143 @@ python integrated_chunker.py --input data/db_qa.txt --line_mode --output output_
 
 - 在 `META_CHUNKING_EXPERIMENTS_REPORT.md` 的 `2.3 评测结果` 下新增 `2.3.4 第二阶段去噪开关消融结果`，写入 1-doc、2-doc、3-doc 的 off/on 全量 QA 指标和差值。
 - 第四章的 QA 重复表已改为索引说明；第四章继续保留去噪相关的 Boundary Clarity、Chunk Stickiness、检索证据保留和 MAD 阈值敏感性结果。
+
+### 2026-08-14 — 启动 db_qa 四种分片方法的四维质量评测
+
+- 目标：以 `/Users/a1234/chunk_code/data/db_qa.txt` 为输入，对比 200 字符、300 字符、400 字符三种机械切分和当前三阶段切分，在语义困惑度、主题距离度、信息差异含量、内容一致性四个维度上进行评测。
+- 数据核对：本地与服务器输入文件一致，大小 `23,264,388` 字节，SHA-256 为 `6283a8b318bfe95c085eb482a1d509247d55cca4870fa97ba46f79b71b0be7ef`。
+- 新增/使用脚本：`/Users/a1234/chunk_code/mechanical_chunker.py`、`/Users/a1234/chunk_code/prepare_topic_model.py`、`/Users/a1234/chunk_code/four_dimension_eval.py`，以及现有三阶段脚本 `integrated_chunker.py`；均已上传到服务器 `/home/humq/chunk_code/`。
+- 分片结果：服务器目录 `/home/humq/chunk_code/results/four_method_chunks_20260814/`。200/300/400 字符机械切分分别为 `46505/32828/26060` 个 chunks；三阶段切分为 `16980` 个 chunks。
+- 评测条件：共享主题模型 `/home/humq/chunk_code/results/four_dimension_eval_20260814/metric_models/topic_lsa.joblib`，使用本地 BGE、Qwen2-1.5B-Instruct 模型，不调用外部 API；四路评测固定参数一致。
+- 并行进程：GPU 2/3/4/5 分别运行机械 200/300/400 字符和三阶段评测，PID 为 `784696/784697/784698/784699`。检查时四个进程均为运行状态，日志已进入向量计算阶段，未发现异常；结果 JSON 尚未生成，仍在计算中。
+- 结果目录：`/home/humq/chunk_code/results/four_dimension_eval_20260814/`，预期生成 `mechanical_200char.json`、`mechanical_300char.json`、`mechanical_400char.json`、`three_stage.json`。
+- 遗留/下一步：继续监控四个评测进程；完成后读取四个 JSON，统一计算各维度差值、标准化对比和排名，并视需要补充到实验结果文档。
+
+### 2026-08-15 — 四种分片方法四维质量评测完成
+
+- 验证：200/300/400 字符机械切分和三阶段切分的四个评测进程均已结束，日志均出现 `saved`，未发现异常或 Traceback。
+- 结果：已生成 `/home/humq/chunk_code/results/four_dimension_eval_20260814/mechanical_200char.json`、`mechanical_300char.json`、`mechanical_400char.json`、`three_stage.json`。
+- 服务器状态：GPU 2–5 已释放，当前四维评测不再运行。
+- 下一步：读取四个 JSON，整理语义困惑度、主题距离度、信息差异含量、内容一致性四个维度的指标、差值和排名。
+
+### 2026-08-15 — 发现并修复四维评测中的语义困惑度 NaN
+
+- 复核四个 JSON 时发现：`semantic_perplexity.mean_log_ppl` 和 `ppl` 在四种方法中均为 `NaN`，其余主题距离、信息差异含量和内容一致性字段均有有效数值。
+- 原因判断：原评测使用 Qwen 半精度计算交叉熵，累计损失出现数值不稳定；已将 PPL 模型和交叉熵计算改为 float32。
+- 修改：新增 `/Users/a1234/chunk_code/recompute_ppl.py`，仅重算 PPL 并回写原四个 JSON，不重复计算其他三个维度；代码已通过语法检查并上传服务器。
+- 当前重算进程：GPU 2/3/4/5 分别运行 200/300/400 字符和三阶段 PPL 重算，PID 为 `787058/787059/787060/787061`，日志位于四维结果目录下的 `*_ppl.log`。
+- 下一步：待 PPL 重算完成后，重新读取四个 JSON，给出四维指标的三位小数结果、差值和排名。
+
+### 2026-08-15 — 整理四种分片方法四维质量评测结果
+
+- PPL 重算已完成：四个结果 JSON 的语义困惑度均为有效有限值，200/300/400 字符和三阶段 PPL 分别为 `18.483/15.909/14.598/13.061`。
+- 主要结果：三阶段在 PPL、主题边界距离、主题对比度、邻域新颖度和邻域冗余度方面最好；200 字符机械切分在信息差异含量和内容一致性综合值方面最高。
+- 三阶段相对 200/300/400 字符机械切分的主指标差值（PPL、主题对比度、信息差异含量、综合一致性）分别为 `(-5.422,+0.138,-0.025,-0.005)`、`(-2.849,+0.109,-0.018,-0.002)`、`(-1.538,+0.082,-0.012,-0.002)`。
+- 新增本地整理文件：`/Users/a1234/RAG_DB_silm/FOUR_METHOD_QUALITY_RESULTS.md`，连续指标统一保留三位小数，并记录指标方向、详细子指标、差值和结论。
+
+### 2026-08-16 — 加入内容一致性长度均一化评测
+
+- 问题：原始内部一致性直接在完整 Chunk 上计算，Chunk 越短越容易获得较高中心相似度，导致机械切分存在长度优势。
+- 实现：`four_dimension_eval.py` 新增固定字符窗口和固定字符预算句子窗口；新增 `recompute_consistency.py`，在统一 `200` 字符评价尺度下重算外部一致性、内部一致性和综合一致性，同时保留原始指标。代码已通过语法检查并上传服务器。
+- 运行：四路长度均一化评测已在 GPU 2–5 完成；新结果目录为 `/home/humq/chunk_code/results/four_dimension_eval_lengthnorm_20260816/`，四个 JSON 均已生成。
+- 结果：长度归一化综合一致性为 200/300/400 字符和三阶段分别 `0.927/0.936/0.936/0.938`；三阶段相对三种机械切分的差值为 `+0.012/+0.002/+0.002`。
+- 文档：`FOUR_METHOD_QUALITY_RESULTS.md` 已新增长度均一化方法、结果和解释；后续报告应同时保留原始完整 Chunk 指标与统一局部尺度指标，避免将二者混为一谈。
+
+### 2026-08-17 — 汇总全部已有实验结果
+
+- 新增总览文档：`/Users/a1234/RAG_DB_silm/ALL_EXPERIMENT_RESULTS.md`。
+- 汇总范围：旧版 Meta-Chunking vs Integrated QA、Baseline/分片规模统计、去噪 off/on 全量 QA、Boundary Clarity、Chunk Stickiness、检索证据保留、MAD 阈值敏感性、200/300/400 字符与三阶段四维质量评测、长度均一化内容一致性、历史 Boundary Clarity 和 top-4 冒烟结果。
+- 文档同时记录了未完成实验（Baseline 完整 QA、Integrated top-4、Relation Coherence、人工噪声标注、显著性检验）以及不同报告/运行版本之间的数值冲突，明确当前采用的结果来源和不可直接混合的实验版本。
+### 2026-08-17 — 采用用户确认的去噪 QA 结果
+
+- 用户确认以下去噪开关 QA 汇总为当前采用版本：1-doc off/on 为 `0.281/0.464/172.715`、`0.302/0.485/171.809`；2-doc off/on 为 `0.114/0.251/492.449`、`0.125/0.278/494.511`；3-doc off/on 为 `0.102/0.255/535.859`、`0.118/0.273/535.453`。
+- 同步采用差值 `on-off`：1-doc `+0.021/+0.021/-0.906`，2-doc `+0.011/+0.027/+2.062`，3-doc `+0.016/+0.018/-0.406`。
+- 已更新：`EXPERIMENT_RESULTS_SUMMARY.md`、`EXPERIMENT_RESULTS_SUMMARY_3DECIMALS.md`、`ALL_EXPERIMENT_RESULTS.md`。`META_CHUNKING_EXPERIMENTS_REPORT.md` 原有表格已与该版本一致，并同步修正了旧结论文字。
+- 当前结论统一为：三类任务的 BLEU-avg 和 ROUGE-L 均有小幅正向变化，但仍需逐问题配对统计、置信区间和显著性检验；旧汇总中的另一组 off 数值不再作为当前结论依据。
+
+### 2026-08-17 — 统一实验结果正文
+
+- `ALL_EXPERIMENT_RESULTS.md` 设为当前唯一实验结果正文。
+- 删除重复的结果正文：`EXPERIMENT_RESULTS_SUMMARY.md`、`EXPERIMENT_RESULTS_SUMMARY_3DECIMALS.md`、`FOUR_METHOD_QUALITY_RESULTS.md`、`META_CHUNKING_EXPERIMENTS_REPORT.md`。
+- 保留 `EXPERIMENT_RESULTS_INDEX.md` 作为结果目录索引，保留 `HANDOFF.md` 作为交接记录；代码、原始数据和服务器上的实验结果目录未删除。
+
+### 2026-08-17 — 调整四维结果章节结构
+
+- 将长度均一化内容一致性的计算说明、明细结果和综合结果并入 `ALL_EXPERIMENT_RESULTS.md` 的 `6.1 主指标`。
+- 删除原独立的长度均一化 `6.3` 小节，并将四维质量结论保留为 `6.3`；结果数值保持不变。
+
+### 2026-08-17 — 删除平均答案长度指标
+
+- 从 `ALL_EXPERIMENT_RESULTS.md` 的旧版主实验和去噪 QA 结果中删除“平均答案长度”行、列及 `on-off` 长度差值。
+- 同步移除依赖该指标的“答案更长”结论；BLEU、ROUGE-L、BERTScore、有效样本数及其他实验指标保持不变。
+
+### 2026-08-17 — 补充四维指标计算方法
+
+- 在 `ALL_EXPERIMENT_RESULTS.md` 第 6.1 节补充四个维度的代码对应计算方法和公式：token 加权语义 PPL、TF-IDF+LSA 主题内离散度/边界距离/主题对比度、TF-IDF 信息密度与邻域新颖度结合的信息差异含量、BGE 外部/内部内容一致性及 200 字符长度均一化版本。
+- 结果表和原有数值未修改；已说明所有方法复用同一主题模型和统一统计口径。
+
+### 2026-08-17 — 修正四维公式展示
+
+- 将 `ALL_EXPERIMENT_RESULTS.md` 第 6.1 节中的 LaTeX 公式块改为兼容 Markdown 渲染器的纯文本公式代码块，避免公式显示为原始标记或乱码。
+- 公式含义、计算口径和实验结果数值均未改变。
+
+### 2026-08-17 — 将公式变量含义改为正文说明
+
+- 删除第 6.1 节中独立的符号对照表，将 `b`、`t`、`C`、`s_i`、`w_i`、`D_in`、`D_boundary`、`rho`、`IDC`、`S_external`、`S_internal` 等变量的含义直接融入公式前后的文字说明。
+- 保留纯文本公式代码块、结果表和原有计算口径，未修改实验数值。
+
+### 2026-08-17 — 重整第 6.2 节四维实验结果
+
+- 将 `ALL_EXPERIMENT_RESULTS.md` 的 `6.2` 由混合详细指标表改为四个独立小节：语义困惑度、主题距离度、信息差异含量、内容一致性。
+- 每个维度分别列出四种切分方法的指标结果和简要解释；内容一致性同时保留原始 Chunk 尺度与 200 字符长度均一化结果。
+- 实验数值未改变，`6.1` 的计算公式和 `6.3` 的总括结论保持不变。
+
+### 2026-08-17 — 重新生成第 6 部分结果结构
+
+- 发现 `ALL_EXPERIMENT_RESULTS.md` 的 `6.2` 仍残留旧的混合指标表，且 `6.3` 总结缺失。
+- 已重新生成 `6.2` 四个维度的实验结果：语义困惑度、主题距离度、信息差异含量、内容一致性，并恢复 `6.3` 四维质量结论。
+- 已保留 6.1 的计算公式、主指标汇总和长度均一化结果，实验数值未重新计算或修改。
+
+### 2026-08-17 — 合并四维结果为单表
+
+- 将 `ALL_EXPERIMENT_RESULTS.md` 的 6.2 改为一张综合结果表，不再按四个维度分别设置小节或单独解释。
+- 单表统一列出 PPL、主题距离、信息差异含量、原始内容一致性和长度均一化内容一致性的全部子指标；数值保持不变。
+
+### 2026-08-17 — 仅保留四个维度综合指标
+
+- 将 `ALL_EXPERIMENT_RESULTS.md` 的 6.2 进一步精简为四列综合指标：PPL、主题对比度、信息差异含量、长度均一化综合内容一致性。
+- 删除 6.2 中所有主题、信息和一致性子指标；原始内容一致性及其子指标仍保留在 6.1 的详细结果中。
+
+### 2026-08-17 — 转换为 Word 兼容格式
+
+- 将 `ALL_EXPERIMENT_RESULTS.md` 中的公式改为 Word 可直接粘贴的线性公式文本，移除代码围栏和 Markdown 公式标记。
+- 将全部表格改为 `+` 分隔格式，并将差值中的正号改为“正”文字，避免与表格分隔符冲突。
+- 在结果文档开头补充 Word“将文字转换成表格”的操作说明。
+
+### 2026-08-17 — 新建论文式实验结果文档
+
+- 新增 `EXPERIMENT_RESULTS_THESIS_STYLE.md`，参考用户提供的“4.4 实验”章节格式，按“实验设置—指标定义—结果表—结果分析—结论与局限性”组织内容。
+- 文档包含四种分片方法四维质量结果、第二阶段去噪消融、Boundary Clarity、Chunk Stickiness、检索证据保留、MAD 阈值敏感性和旧版端到端 QA 结果。
+- 新文档中的表格统一使用 `+` 分隔，公式统一使用 Word 线性文本格式，便于直接复制到论文 Word 文档。
+
+### 2026-08-17 — 弱化论文式文档中的代码实现细节
+
+- 将 `EXPERIMENT_RESULTS_THESIS_STYLE.md` 中的函数级、变量级和公式级实现描述改写为评测程序功能介绍，保留指标含义、处理流程和结果解释。
+- 删除论文正文中不必要的底层实现细节，使文档更接近实验章节的叙述风格。
+
+### 2026-08-17 — 删除论文式文档中的文件名与代码标识
+
+- 将论文式文档中的数据文件名、去噪开关变量名、映射状态变量名和阈值变量名改写为自然语言描述。
+- 保留数据类型、实验条件和模型信息，不再在正文中展示代码文件名或程序变量名。
+
+### 2026-08-17 — 检查服务器实验进程状态
+
+- 服务器仍有两个关系质量评测进程：PID `410154`（`denoise_off`，GPU 0）和 PID `410206`（`denoise_on`，GPU 1），运行时间约 5 天 14 小时，CPU 占用均约 100%。
+- 两个进程的日志最后分别停在 `relation PPL pass done`：off 为 2026-08-12 13:03，on 为 2026-08-12 13:02；对应 `fast_relation_off_full_v6.json` 和 `fast_relation_on_full_v6.json` 均尚未生成。
+- 当前 GPU 0/1 有显存占用但 GPU 利用率为 0%，GPU 2/3 空闲；GPU 4–7 由其他 `code_generation` 进程占用。暂未终止关系评测进程，后续需决定是继续观察、诊断卡住原因，还是停止后重启。
+
+### 2026-08-17 — 终止卡住的关系质量评测
+
+- 已核对并发送 `SIGTERM`，终止 PID `410154`（`denoise_off`）和 PID `410206`（`denoise_on`）。
+- 2 秒后复查，两个 PID 均已退出；未影响其他实验进程。
+- 由于两个最终 JSON 在终止前尚未生成，`fast_relation_off_full_v6.json` 和 `fast_relation_on_full_v6.json` 仍需后续重新运行才能得到。
