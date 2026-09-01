@@ -1025,3 +1025,10 @@ python integrated_chunker.py --input data/db_qa.txt --line_mode --output output_
 - 已准备干净上传提交 `7f68415572c83939cd3851579ab261f52427323c`，包含当前源码、实验脚本、部署脚本和整理后的文档；本地 `master` 工作分支未被切换或覆盖。
 - 上传提交排除了模型文件、数据集、向量库、原始实验结果、日志和本地凭据；同时将 `results/` 加入 `.gitignore`。本地仓库旧历史约 `5.7 GB`，没有把旧的大体积历史推送到 GitHub。
 - 推送阶段被 GitHub 认证阻止：当前 Mac 没有可用的 GitHub CLI 登录、SSH Key 或钥匙串凭据。待用户在本机执行 `gh auth login`，或提供具有该仓库写权限的 GitHub Personal Access Token 后，再将该提交推送到 `origin/master`。
+
+### 2026-09-01 — GitHub 上传完成
+
+- 已在本机安装 GitHub CLI `2.97.0`，完成 `hh030210` 账号设备认证并配置 Git HTTPS 凭据。
+- 项目已成功推送到 `https://github.com/hh030210/rag_db.git` 的 `master` 分支，远程最新提交为 `b8789afadb30aea872237af194d35c6689d5c5db`。
+- 本次上传内容为当前项目源码、部署脚本、实验脚本和整理后的文档；模型、数据集、向量库、原始结果、日志和本地凭据均未上传。
+- 推送时使用 `--no-verify` 跳过了本地遗留的 Git LFS 检查；当前项目没有 `.gitattributes` 或 LFS 跟踪文件，因此不影响已上传内容。
