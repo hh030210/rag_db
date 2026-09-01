@@ -1039,4 +1039,4 @@ python integrated_chunker.py --input data/db_qa.txt --line_mode --output output_
 - 原文件夹约 `5.5 GB`；上传版本约 `17 MB`，保留切片算法、评测脚本、Meta-Chunking 源码、部署说明和论文实验说明。
 - 已排除数据集、实验结果、日志、模型缓存、Milvus 数据卷、向量库、Python 缓存、Cursor 导出和内嵌 Git 历史，避免上传超大文件及本地运行状态。
 - 发现的硬编码 SiliconFlow API Key 已改为从 `SILICONFLOW_API_KEY` 环境变量读取，上传版本未发现真实 API Key 或服务器密码。
-- 文件夹上传提交为 `51fafd138c8fb480953a811d179afa67df8316e0`；随后本交接记录的最终状态提交将继续推送到同一 `master` 分支。
+- 文件夹上传提交为 `51fafd138c8fb480953a811d179afa67df8316e0`；本交接记录的最终状态已随提交 `2f293c1ab1975bc5a756d9705e8928d4d0305d81` 推送到同一 `master` 分支。
