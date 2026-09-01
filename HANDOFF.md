@@ -1018,3 +1018,10 @@ python integrated_chunker.py --input data/db_qa.txt --line_mode --output output_
 - 8 个维度字段已写入每个 point：`dim_历史事件`、`dim_朝代`、`dim_涉及皇帝`、`dim_文化称号`、`dim_地理位置`、`dim_建筑功能`、`dim_相关人物`、`dim_事件原因`。抽样和全量核验均确认字段不缺失；清洗后至少含一个非空维度标签的 chunk 为 `31` 条。
 - 清洗后各维度非空字段计数：历史事件 `17`、朝代 `3`、涉及皇帝 `4`、文化称号 `12`、地理位置 `20`、建筑功能 `19`、相关人物 `20`、事件原因 `11`。由于当前倒排索引仍要求覆盖率至少 `50%`，`dimension_metadata.json` 本轮过滤出 `0` 个可用于倒排过滤的维度；这不影响 Qdrant payload 中的维度字段保存，但后续若要做维度检索需单独调整覆盖率阈值或检索策略。
 - 远程日志：`/home/humq/rag_db_silm/results/server0/rebuild_step5_scenic_test14_retry.log`、`rebuild_step5_scenic_test14_sanitize.log`、`rebuild_step6_scenic_test14_final.log`；标签结果：`experiment_data/tags_output_scenic_test14.json` 和 `step5_result_scenic_test14.json`。
+
+### 2026-09-01 — GitHub 上传准备
+
+- 已确认远程仓库为 `https://github.com/hh030210/rag_db.git`，远程当前没有可用分支。
+- 已准备干净上传提交 `7f68415572c83939cd3851579ab261f52427323c`，包含当前源码、实验脚本、部署脚本和整理后的文档；本地 `master` 工作分支未被切换或覆盖。
+- 上传提交排除了模型文件、数据集、向量库、原始实验结果、日志和本地凭据；同时将 `results/` 加入 `.gitignore`。本地仓库旧历史约 `5.7 GB`，没有把旧的大体积历史推送到 GitHub。
+- 推送阶段被 GitHub 认证阻止：当前 Mac 没有可用的 GitHub CLI 登录、SSH Key 或钥匙串凭据。待用户在本机执行 `gh auth login`，或提供具有该仓库写权限的 GitHub Personal Access Token 后，再将该提交推送到 `origin/master`。
