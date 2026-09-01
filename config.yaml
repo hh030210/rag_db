@@ -1,0 +1,113 @@
+# ============================================================
+# 融合系统配置文件
+# 融合了 RAG_DB_slim 和 code1 的能力
+# ============================================================
+
+# 关系型数据库配置（MySQL）
+rdb:
+  type: mysql
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: "${MYSQL_ROOT_PASSWORD:-}"
+  database: Main_index
+  table: MainIndex
+  doc_id_column: Doc_ID
+  corpus_id_column: corpus_id
+  updated_at_column: updated_at
+  profile_column: profile_json
+
+# 向量数据库配置 - Qdrant（生产环境）
+vecdb_qdrant:
+  type: qdrant
+  host: 127.0.0.1
+  port: 6333
+  grpc_port: 6334
+  collection_name: rag_chunks
+  vector_dim: 1024
+  hnsw_ef_construct: 512
+  hnsw_m: 16
+  distance: Cosine
+
+# Embedding 模型配置（BGE-M3）
+embedding:
+  model_name: bge-m3
+  model_path: ${MODEL_PATH:-./model}/bge-m3
+  batch_size: 64
+  device: auto
+  normalize_embeddings: true
+
+# LLM 配置（SiliconFlow Qwen）
+llm:
+  api_key: "${LLM_API_KEY:-}"
+  base_url: https://api.siliconflow.cn/v1
+  model: Qwen/Qwen2.5-7B-Instruct
+  timeout: 60
+
+# LLM 配置 - Qwen3-8B（code1 原有）
+llm_qwen3:
+  api_key: "${LLM_API_KEY:-}"
+  base_url: https://api.siliconflow.cn/v1
+  model: Qwen/Qwen3-8B
+  timeout: 120
+
+# Embedding 模型（BGE-large-zh-v1.5）- code1 原有
+embedding_legacy:
+  model_path: "I:/毕业论文最新版/Code/models/embedding/bge-large-zh-v1.5"
+  dimension: 1024
+  device: cpu
+
+# 文件上传配置
+file_upload:
+  max_size_mb: 100
+  allowed_extensions:
+    - .pdf
+    - .docx
+    - .doc
+    - .pptx
+    - .ppt
+    - .xlsx
+    - .xls
+    - .txt
+    - .md
+
+# RAG 检索配置
+rag:
+  default_top_k: 5
+  default_chunk_size: 500
+  default_chunk_overlap: 50
+  max_chat_history: 5
+  default_temperature: 0.7
+  max_tokens: 2000
+
+# 检索融合配置
+retrieval:
+  vector_top_k: 200
+  rrf_k: 60
+  default_alpha: 0.2
+  soft_match_threshold: 0.65
+  sem_top_k: 20
+  dim_top_k: 100
+
+# code1 数据路径配置（提示优化相关）
+code1_data:
+  base_path: "I:/bylw_final/Code/chapter3/codes/bylw_rag/new_experiments"
+  tourist_eval: "I:/bylw_final/Code/chapter3/codes/bylw_rag/new_experiments/datas/tourist/tourist_eval.json"
+  prompt_library: "I:/bylw_final/Code/chapter3/codes/bylw_rag/new_experiments/prompt_library/tourist"
+  iteration_results: "I:/bylw_final/Code/chapter3/codes/bylw_rag/new_experiments/iteration_results/tourist"
+  optimized_prompts: "I:/bylw_final/Code/chapter3/codes/bylw_rag/new_experiments/optimized_prompts/tourist"
+
+# 服务器配置
+server:
+  host: 0.0.0.0
+  port: 8000
+  frontend_port: 7971
+  log_level: INFO
+
+# RAG_DB_slim Pipeline 配置
+pipeline:
+  # RAG_DB_slim 的项目根目录（用于调用 pipeline_qdrant.py）
+  root: "D:/RAG_DB_slim"
+  input_dir: "D:/RAG_DB_slim/data_input"
+  output_chunks_dir: "D:/RAG_DB_slim/output_chunks"
+  experiment_data_dir: "D:/RAG_DB_slim/experiment_data"

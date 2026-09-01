@@ -1,0 +1,36 @@
+# interactive_qa 配置文件
+# ============================
+# 此文件用于配置 interactive_qa.py 的启动参数
+# 编辑后运行: python gen_interactive_qa.py
+
+# ---- LLM (DashScope) 配置 ----
+llm:
+  api_key: ""
+  model: "qwen-plus"
+  max_retries: 3
+  retry_sleep: 5       # 重试等待秒数
+  min_interval: 0.1   # API 调用最小间隔(秒)
+
+# ---- 检索配置 ----
+retrieval:
+  mode: "fusion"      # fusion | dim | sem
+  top_k: 5            # 返回结果数量
+  dim_alpha: 0.5     # 维度检索权重 (fusion/dim模式)
+  sem_alpha: 0.5      # 语义检索权重
+  rerank_mode: "score" # 重排模式: score(得分融合) | interleaved(交替去重)
+
+# ---- 问答配置 ----
+qa:
+  enable: true        # 是否开启 LLM 问答生成
+  temperature: 0.1    # LLM 温度
+  max_tokens: 512     # LLM 最大 Token 数
+
+# ---- 展示配置 ----
+display:
+  chars: 300          # 每条结果展示字符数
+  verbose: false      # 详细模式(显示维度约束、得分分解)
+
+# ---- 数据库配置 ----
+database:
+  # Milvus Collection 名称（从 db_config.py 读取，此处可覆盖）
+  collection_name: ""

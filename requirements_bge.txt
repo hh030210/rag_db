@@ -1,0 +1,2 @@
+# BGE 编码器依赖（FlagEmbedding 失败时回退使用）
+sentence-transformers>=2.2

@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <title>RAG分片评价体系</title>
+  <desc>展示四个分片评价层级、当前常用评价方式、本研究评价方式和评价层级有效性。</desc>
+
+  <rect width="1920" height="1080" fill="#ffffff"/>
+
+  <text x="70" y="70" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="42" font-weight="600" fill="#17324d">RAG 分片评价体系</text>
+  <text x="70" y="112" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="22" fill="#5d7185">从分片结构、语义关系到信息保留的多层次评价框架</text>
+
+  <!-- Header -->
+  <rect x="60" y="150" width="330" height="70" rx="10" fill="#17324d"/>
+  <rect x="400" y="150" width="445" height="70" rx="10" fill="#17324d"/>
+  <rect x="855" y="150" width="500" height="70" rx="10" fill="#176b52"/>
+  <rect x="1365" y="150" width="495" height="70" rx="10" fill="#a85c16"/>
+
+  <text x="225" y="195" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="27" font-weight="600" fill="#ffffff">评价层级</text>
+  <text x="622" y="195" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="27" font-weight="600" fill="#ffffff">当前常用评价方式</text>
+  <text x="1105" y="195" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="27" font-weight="600" fill="#ffffff">本研究的评价方式</text>
+  <text x="1612" y="195" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="27" font-weight="600" fill="#ffffff">该评价层级的有效性</text>
+
+  <!-- Row 1 -->
+  <rect x="60" y="235" width="330" height="190" rx="10" fill="#e7f0fb" stroke="#9fc2e8" stroke-width="2"/>
+  <rect x="400" y="235" width="445" height="190" rx="10" fill="#f3f5f7" stroke="#d2d9df" stroke-width="2"/>
+  <rect x="855" y="235" width="500" height="190" rx="10" fill="#e5f4ed" stroke="#9cd5bd" stroke-width="2"/>
+  <rect x="1365" y="235" width="495" height="190" rx="10" fill="#fff1df" stroke="#f0c48c" stroke-width="2"/>
+
+  <text x="225" y="295" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="29" font-weight="600" fill="#17324d">
+    <tspan x="225" dy="0">分片边界</tspan><tspan x="225" dy="40">质量</tspan>
+  </text>
+  <text x="425" y="275" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="23" fill="#304354">
+    <tspan x="425" dy="0">相邻句向量距离</tspan><tspan x="425" dy="34">人工边界标注</tspan><tspan x="425" dy="34">边界清晰度评价</tspan>
+  </text>
+  <text x="880" y="270" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="22" fill="#205b46">
+    <tspan x="880" dy="0">主题内离散度</tspan><tspan x="880" dy="32">相邻 Chunk 主题边界距离</tspan><tspan x="880" dy="32">主题对比度</tspan><tspan x="880" dy="32">Boundary Clarity</tspan>
+  </text>
+  <text x="1390" y="270" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="21" fill="#74420e">
+    <tspan x="1390" dy="0">评价切分点是否位于主题或语义变化处，</tspan><tspan x="1390" dy="31">判断相邻 Chunk 是否被清晰分离，</tspan><tspan x="1390" dy="31">是衡量分片准确性的基础层级。</tspan>
+  </text>
+
+  <!-- Row 2 -->
+  <rect x="60" y="440" width="330" height="190" rx="10" fill="#e7f0fb" stroke="#9fc2e8" stroke-width="2"/>
+  <rect x="400" y="440" width="445" height="190" rx="10" fill="#f3f5f7" stroke="#d2d9df" stroke-width="2"/>
+  <rect x="855" y="440" width="500" height="190" rx="10" fill="#e5f4ed" stroke="#9cd5bd" stroke-width="2"/>
+  <rect x="1365" y="440" width="495" height="190" rx="10" fill="#fff1df" stroke="#f0c48c" stroke-width="2"/>
+
+  <text x="225" y="500" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="28" font-weight="600" fill="#17324d">
+    <tspan x="225" dy="0">Chunk 内部</tspan><tspan x="225" dy="40">语义连贯性</tspan>
+  </text>
+  <text x="425" y="480" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="23" fill="#304354">
+    <tspan x="425" dy="0">平均语义相似度</tspan><tspan x="425" dy="34">PPL</tspan><tspan x="425" dy="34">句间一致性</tspan>
+  </text>
+  <text x="880" y="475" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="22" fill="#205b46">
+    <tspan x="880" dy="0">Qwen PPL</tspan><tspan x="880" dy="32">Chunk 内主题离散度</tspan><tspan x="880" dy="32">句子与 Chunk 中心一致性</tspan>
+  </text>
+  <text x="1390" y="475" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="21" fill="#74420e">
+    <tspan x="1390" dy="0">评价 Chunk 内部句子是否围绕同一</tspan><tspan x="1390" dy="31">语义单元组织，是衡量 Chunk</tspan><tspan x="1390" dy="31">可理解性的核心层级。</tspan>
+  </text>
+
+  <!-- Row 3 -->
+  <rect x="60" y="645" width="330" height="190" rx="10" fill="#e7f0fb" stroke="#9fc2e8" stroke-width="2"/>
+  <rect x="400" y="645" width="445" height="190" rx="10" fill="#f3f5f7" stroke="#d2d9df" stroke-width="2"/>
+  <rect x="855" y="645" width="500" height="190" rx="10" fill="#e5f4ed" stroke="#9cd5bd" stroke-width="2"/>
+  <rect x="1365" y="645" width="495" height="190" rx="10" fill="#fff1df" stroke="#f0c48c" stroke-width="2"/>
+
+  <text x="225" y="700" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="27" font-weight="600" fill="#17324d">
+    <tspan x="225" dy="0">Chunk 间独立性</tspan><tspan x="225" dy="38">与关系保持</tspan>
+  </text>
+  <text x="425" y="685" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="22" fill="#304354">
+    <tspan x="425" dy="0">通常不单独评价</tspan><tspan x="425" dy="34">部分方法使用图结构</tspan><tspan x="425" dy="34">或关系检索</tspan>
+  </text>
+  <text x="880" y="680" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="22" fill="#205b46">
+    <tspan x="880" dy="0">Chunk Stickiness</tspan><tspan x="880" dy="32">邻域新颖度</tspan><tspan x="880" dy="32">邻域冗余度</tspan><tspan x="880" dy="32">信息差异含量</tspan>
+  </text>
+  <text x="1390" y="680" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="21" fill="#74420e">
+    <tspan x="1390" dy="0">评价相邻 Chunk 是否存在过度重复、</tspan><tspan x="1390" dy="31">语义粘连或关系断裂，弥补只评价</tspan><tspan x="1390" dy="31">Chunk 内部质量的不足。</tspan>
+  </text>
+
+  <!-- Row 4 -->
+  <rect x="60" y="850" width="330" height="190" rx="10" fill="#e7f0fb" stroke="#9fc2e8" stroke-width="2"/>
+  <rect x="400" y="850" width="445" height="190" rx="10" fill="#f3f5f7" stroke="#d2d9df" stroke-width="2"/>
+  <rect x="855" y="850" width="500" height="190" rx="10" fill="#e5f4ed" stroke="#9cd5bd" stroke-width="2"/>
+  <rect x="1365" y="850" width="495" height="190" rx="10" fill="#fff1df" stroke="#f0c48c" stroke-width="2"/>
+
+  <text x="225" y="925" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="29" font-weight="600" fill="#17324d">信息完整性</text>
+  <text x="425" y="890" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="22" fill="#304354">
+    <tspan x="425" dy="0">下游 QA</tspan><tspan x="425" dy="34">人工证据标注</tspan><tspan x="425" dy="34">答案覆盖率</tspan>
+  </text>
+  <text x="880" y="885" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="21" fill="#205b46">
+    <tspan x="880" dy="0">切分前后外部内容一致性</tspan><tspan x="880" dy="31">Chunk 内部一致性</tspan><tspan x="880" dy="31">长度归一化一致性</tspan><tspan x="880" dy="31">答案二元组证据覆盖率</tspan>
+  </text>
+  <text x="1390" y="885" font-family="PingFang SC, Microsoft YaHei, Arial, sans-serif" font-size="21" fill="#74420e">
+    <tspan x="1390" dy="0">评价切片和去噪是否保留原文关键信息，</tspan><tspan x="1390" dy="31">识别删除、截断或过度拆分造成的</tspan><tspan x="1390" dy="31">证据损失；长度归一化可减少长度偏差。</tspan>
+  </text>
+</svg>

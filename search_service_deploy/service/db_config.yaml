@@ -1,0 +1,24 @@
+# RAG 检索服务数据库配置
+# 复制本文件为 db_config.yaml 后填入服务器实际值即可
+
+vecdb_qdrant:
+  type: qdrant
+  host: 127.0.0.1                  # Qdrant HTTP 地址
+  port: 6333
+  grpc_port: 6334
+  collection_name: unified_corpus   # 主语料 collection
+  dim_tags_collection: dimension_tags   # 维度标签 collection
+  vector_dim: 1024                 # BGE-M3 维度
+  distance: Cosine
+
+embedding:
+  model_name: bge-m3
+  model_path: /models/bge-m3       # BGE-M3 模型绝对路径（可改）
+  batch_size: 64
+  device: cpu
+  normalize_embeddings: true
+
+# 检索默认
+api:
+  qdrant_base: http://127.0.0.1:6333
+  default_top_k: 8
