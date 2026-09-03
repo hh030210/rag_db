@@ -1236,4 +1236,4 @@ python integrated_chunker.py --input data/db_qa.txt --line_mode --output output_
 - 已将本地最新源码、`chunk_code/` 分片项目、问答评测脚本、Qdrant 部署脚本、实验说明和 badcase 分析文档整理到 `master` 分支。
 - 本次明确保留的核心修改包括：完整 chunk 上下文问答输入、查询分析与景区/实体识别、相关维度选择、景区硬过滤、同维度精确/别名优先、向量匹配 threshold + margin、覆盖率/实体一致性重排、归一化融合，以及自动 badcase 统计与审计字段。
 - 上传前保留了数据集、实验结果、日志、模型文件、向量库、本地缓存和凭据排除规则；API Key、服务器密码等运行参数继续通过环境变量或本地配置注入。
-- 远程仓库原有上传历史已合并保留；本次提交后续将推送到 `https://github.com/hh030210/rag_db.git` 的 `master` 分支。
+- 远程仓库原有上传历史已合并保留；本次代码已推送到 `https://github.com/hh030210/rag_db.git` 的 `master` 分支。
