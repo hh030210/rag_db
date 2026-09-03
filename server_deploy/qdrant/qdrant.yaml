@@ -1,0 +1,12 @@
+log_level: INFO
+
+storage:
+  storage_path: /home/humq/qdrant_data/storage
+  snapshots_path: /home/humq/qdrant_data/snapshots
+  on_disk_payload: true
+
+service:
+  host: 127.0.0.1
+  http_port: 6333
+  grpc_port: 6334
+  enable_cors: false

@@ -21,12 +21,14 @@ RAG_DB 维度 Pipeline 集成脚本（本地化版本，无外部 API 依赖）
     python dimension_integration.py --all           # 完整流程
     python dimension_integration.py --step 3 --doc_ids doc001 doc002  # 局部处理
     python dimension_integration.py --step 3 --force  # 强制重跑（跳过断点）
+    python dimension_integration.py --step 1 --validate_all  # 全量复核 schema（不写标签）
 """
 
 import os
 import sys
 import json
 import argparse
+import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from tqdm import tqdm
@@ -46,21 +48,18 @@ sys.path.insert(0, str(CODE_DIR))
 sys.path.insert(0, str(project_root))
 
 from db_config import get_config
-import yaml
 
-# 读取配置中的 DashScope API Key
+# 读取配置中的 DashScope API Key。通过 db_config.py 统一展开
+# `${DASHSCOPE_API_KEY:-}`，避免把占位符原样当成真实 key。
 _dashscope_key = ""
-_yaml_cfg_path = project_root / "db_config.yaml"
-if _yaml_cfg_path.exists():
-    try:
-        _yaml_cfg = yaml.safe_load(open(_yaml_cfg_path, encoding="utf-8"))
-        _dashscope_key = _yaml_cfg.get("qgen", {}).get("api_key", "")
-        if _dashscope_key:
-            os.environ["DASHSCOPE_API_KEY"] = _dashscope_key
-            print(f"[配置] DashScope API Key 已加载 (前6位: {_dashscope_key[:6]}...)")
-    except Exception as e:
-        print(f"[配置] 读取 db_config.yaml 失败: {e}")
-        _dashscope_key = ""
+try:
+    _dashscope_key = str(getattr(get_config().qgen, "api_key", "") or "")
+    if _dashscope_key:
+        os.environ["DASHSCOPE_API_KEY"] = _dashscope_key
+        print(f"[配置] DashScope API Key 已加载 (前6位: {_dashscope_key[:6]}...)")
+except Exception as e:
+    print(f"[配置] 读取 qgen 配置失败: {e}")
+    _dashscope_key = ""
 
 if not _dashscope_key:
     _dashscope_key = os.getenv("DASHSCOPE_API_KEY", "")
@@ -90,16 +89,33 @@ PATH_V_CAND = DATA_DIR / "V_cand.json"
 PATH_V_CORE = DATA_DIR / "V_core.json"
 PATH_TAGS = DATA_DIR / "tags_output.json"
 PATH_DIM_META = DATA_DIR / "dimension_metadata.json"
+PATH_DIM_DIAGNOSTICS = DATA_DIR / "dimension_diagnostics.json"
 
 # 维度挖掘参数
 K_CLUSTERS = 50
 N_CORE_SAMPLES = 5
 N_BOUND_SAMPLES = 5
 TH_COV = 0.20   # 覆盖率阈值（降低到 20%，让融合逻辑有机会合并维度）
-TH_DIS = 1.0
+TH_DIS = 0.30   # 归一化熵阈值；不再使用受取值数量影响的原始熵
 TH_DIFF = 0.3
 MAX_ITER = 2
 SAMPLE_LIMIT = 10000  # 聚类采样时最多加载的文档数（用于 Milvus 向量聚类）
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """读取整数环境变量，非法或过小值回退到默认值。"""
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """读取布尔环境变量。"""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 # ===================== 工具函数 =====================
@@ -124,6 +140,32 @@ def _calc_jaccard(list_a: list, list_b: list) -> float:
     intersection = len(set_a & set_b)
     union = len(set_a | set_b)
     return intersection / union
+
+
+def _normalized_entropy(values: list) -> float:
+    """计算标签值分布的归一化熵，结果范围为 [0, 1]。"""
+    cleaned = [str(value).strip() for value in values if value and str(value).strip() not in {"NULL", "NONE"}]
+    if len(cleaned) <= 1:
+        return 0.0
+    counts = Counter(cleaned)
+    if len(counts) <= 1:
+        return 0.0
+    raw_entropy = entropy([count / len(cleaned) for count in counts.values()])
+    max_entropy = np.log(len(counts))
+    return float(raw_entropy / max_entropy) if max_entropy > 0 else 0.0
+
+
+def _spread_items(items: list, limit: int) -> list:
+    """从列表中均匀抽取若干项，避免只使用列表前缀。"""
+    if not items:
+        return []
+    limit = max(1, min(limit, len(items)))
+    if limit == len(items):
+        return list(items)
+    if limit == 1:
+        return [items[0]]
+    indices = [round(i * (len(items) - 1) / (limit - 1)) for i in range(limit)]
+    return [items[i] for i in indices]
 
 
 def _parse_chunks_to_docs(data) -> List[Dict[str, str]]:
@@ -404,6 +446,7 @@ class DimensionMiner:
         self.vectorizer = None
         self.docs_source = docs_source
         self._in_memory_docs: List[Dict[str, str]] = []
+        self.dimension_diagnostics: Dict[str, Dict[str, Any]] = {}
 
     def _load_docs_from_source(self) -> List[Dict[str, str]]:
         """统一加载文档"""
@@ -535,7 +578,7 @@ class DimensionMiner:
 
     def step2_generate_candidates(self, sampled_docs):
         """LLM 归纳候选维度"""
-        if PATH_V_CAND.exists():
+        if PATH_V_CAND.exists() and not _env_flag("DIM_FORCE_REDISCOVER"):
             print("检测到已有候选维度，跳过生成")
             with open(PATH_V_CAND, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -550,8 +593,9 @@ class DimensionMiner:
             import traceback
             traceback.print_exc()
             raise
-        # 强制截断：避免候选维度过多导致后续 merge 调用爆炸
-        MAX_CANDIDATES = 15
+        # 仅做可控上限，不再固定截断到 15 个；维度数量由后续全量验证
+        # 和质量诊断共同决定。LLM 输出已经在 llm_service 中去重和清理。
+        MAX_CANDIDATES = _env_int("MAX_DIM_CANDIDATES", 30, minimum=1)
         if len(V_cand) > MAX_CANDIDATES:
             print(f"  LLM 返回 {len(V_cand)} 个候选维度，截断到前 {MAX_CANDIDATES} 个")
             V_cand = V_cand[:MAX_CANDIDATES]
@@ -564,7 +608,7 @@ class DimensionMiner:
 
     def step3_iterative_optimization(self, initial_dims):
         """迭代优化（使用与聚类相同的文档集和向量器）"""
-        if PATH_V_CORE.exists():
+        if PATH_V_CORE.exists() and not _env_flag("DIM_FORCE_REDISCOVER"):
             print("检测到已有核心维度，跳过优化")
             with open(PATH_V_CORE, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -587,6 +631,7 @@ class DimensionMiner:
 
         self.validation_texts = texts  # 保存给 Step 3 使用
         verified_dims: Set[str] = set()
+        validation_max_chars = _env_int("DIM_VALIDATION_CHARS", 4000, minimum=0)
 
         for iteration in range(MAX_ITER):
             print(f"\n--- Iteration {iteration + 1} / {MAX_ITER} ---")
@@ -598,12 +643,32 @@ class DimensionMiner:
             # 抽取
             print(f"  开始抽取（{len(active)} 个维度 x {len(texts)} 条文本）...")
             extraction_results = {dim: [] for dim in active}
-            for text in tqdm(texts, desc="抽取进度"):
-                for dim in active:
-                    res = self.miner.extract_dimension_value(text, dim)
-                    if res:
-                        extraction_results[dim].append(res)
-            print(f"  抽取完成，各维度命中数: {[(d, len(extraction_results[d])) for d in active[:5]]}...")
+            extraction_doc_hits = {dim: 0 for dim in active}
+            validation_batch_size = _env_int("DIM_SCHEMA_BATCH_SIZE", 8, minimum=1)
+            for start in tqdm(
+                range(0, len(texts), validation_batch_size),
+                desc="Schema 验证进度",
+            ):
+                batch_texts = texts[start:start + validation_batch_size]
+                records = [
+                    {"doc_id": f"sample_{start + offset}", "doc_text": text}
+                    for offset, text in enumerate(batch_texts)
+                ]
+                batch_result = self.miner.validate_dimension_schema_batch(
+                    records, active, max_text_chars=validation_max_chars
+                )
+                for record in records:
+                    dim_values = batch_result.get(record["doc_id"], {})
+                    for dim in active:
+                        values = dim_values.get(dim, [])
+                        if values:
+                            # 覆盖率按“命中的 chunk 数”计算；辨识度按全部值统计。
+                            extraction_doc_hits[dim] += 1
+                            extraction_results[dim].extend(values)
+            print(
+                "  抽取完成，各维度命中 chunk 数: "
+                f"{[(d, extraction_doc_hits[d]) for d in active[:5]]}..."
+            )
 
             # 诊断
             dims_to_remove = set()
@@ -614,8 +679,19 @@ class DimensionMiner:
             # Part A: 覆盖率 & 辨识度诊断（先全部收集，不调用 LLM）
             for dim in active:
                 vals = extraction_results[dim]
-                cov = len(vals) / len(texts) if texts else 0
-                dis = entropy([c / len(vals) for c in Counter(vals).values()]) if vals else 0.0
+                covered_chunks = extraction_doc_hits[dim]
+                cov = covered_chunks / len(texts) if texts else 0
+                dis = _normalized_entropy(vals)
+
+                self.dimension_diagnostics[dim] = {
+                    "covered_chunks": covered_chunks,
+                    "total_chunks": len(texts),
+                    "coverage": round(cov, 4),
+                    "value_count": len(vals),
+                    "unique_values": len(set(vals)),
+                    "normalized_entropy": round(dis, 4),
+                    "validation_chars": validation_max_chars,
+                }
 
                 issue_type = None
                 msg = ""
@@ -639,7 +715,10 @@ class DimensionMiner:
             prefilter_map = {}  # failing_dim -> [top3_targets]
             if len(approved) > 10 and self.vectorizer is not None:
                 try:
-                    cov_map = {d: len(extraction_results.get(d, [])) / len(texts) for d in approved}
+                    cov_map = {
+                        d: extraction_doc_hits.get(d, 0) / len(texts)
+                        for d in approved
+                    }
                     pool = sorted(approved, key=lambda d: cov_map[d], reverse=True)[:20]
                     pool_vecs = self.vectorizer.transform(pool).toarray().astype(np.float32)
                     for dim, _, _, _, _, _ in failing_dims:
@@ -727,15 +806,29 @@ class DimensionMiner:
                 if not nd or nd in current_dims or nd in verified_dims:
                     continue
 
-                sample_texts = texts[:20] if len(texts) >= 20 else texts
+                sample_texts = _spread_items(texts, 20)
                 nd_vals = []
+                nd_doc_hits = 0
                 for txt in sample_texts:
-                    rv = self.miner.extract_dimension_value(txt, nd)
-                    if rv:
-                        nd_vals.append(rv)
+                    values = self.miner.extract_dimension_values(
+                        txt, nd, max_chars=validation_max_chars
+                    )
+                    if values:
+                        nd_doc_hits += 1
+                        nd_vals.extend(values)
 
-                nd_cov = len(nd_vals) / len(sample_texts) if sample_texts else 0
-                nd_dis = entropy([c / len(nd_vals) for c in Counter(nd_vals).values()]) if nd_vals else 0.0
+                nd_cov = nd_doc_hits / len(sample_texts) if sample_texts else 0
+                nd_dis = _normalized_entropy(nd_vals)
+                self.dimension_diagnostics[nd] = {
+                    "covered_chunks": nd_doc_hits,
+                    "total_chunks": len(sample_texts),
+                    "coverage": round(nd_cov, 4),
+                    "value_count": len(nd_vals),
+                    "unique_values": len(set(nd_vals)),
+                    "normalized_entropy": round(nd_dis, 4),
+                    "validation_chars": validation_max_chars,
+                    "is_new_dimension": True,
+                }
 
                 if nd_cov >= TH_COV and nd_dis >= TH_DIS:
                     validated_new_dims.append(nd)
@@ -756,7 +849,120 @@ class DimensionMiner:
         with open(PATH_V_CORE, "w", encoding="utf-8") as f:
             json.dump(current_dims, f, ensure_ascii=False, indent=2)
 
+        diagnostics = {
+            "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "docs_source": str(self.docs_source),
+            "sampled_chunks": len(texts),
+            "thresholds": {
+                "coverage": TH_COV,
+                "normalized_entropy": TH_DIS,
+                "difference": TH_DIFF,
+            },
+            "dimensions": self.dimension_diagnostics,
+            "core_dimensions": current_dims,
+            "note": (
+                "本文件只记录候选维度名称的发现/验证诊断，不是 chunk 标签结果；"
+                "具体维度值的打标签由后续独立流程完成。"
+            ),
+        }
+        with open(PATH_DIM_DIAGNOSTICS, "w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+        print(f"维度发现诊断已保存至: {PATH_DIM_DIAGNOSTICS}")
+
         return current_dims
+
+    def validate_schema_on_all_chunks(
+        self,
+        dimensions: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """在全量 chunk 上复核维度 schema，但不生成、不写入标签。
+
+        这一步只回答“候选维度在全量 chunk 中是否有明确证据、取值是否具有区分度”，
+        用于验证维度名称是否值得进入后续打标签阶段。它不会修改 Qdrant/MySQL，
+        也不会产出 `dim_*` 字段。
+        """
+        docs = self._load_docs_from_source()
+        dimensions = [str(dim).strip() for dim in (dimensions or []) if str(dim).strip()]
+        if not dimensions:
+            return {}
+
+        texts = [str(doc.get("text", "")) for doc in docs if str(doc.get("text", "")).strip()]
+        if not texts:
+            return {}
+
+        max_chars = _env_int("DIM_VALIDATION_CHARS", 4000, minimum=0)
+        # 维度发现的全量复核默认抽取一小批维度，避免把它误当成正式标签生成。
+        batch_size = _env_int("DIM_SCHEMA_VALIDATE_BATCH_SIZE", 8, minimum=1)
+        covered = {dim: 0 for dim in dimensions}
+        values_by_dim = {dim: [] for dim in dimensions}
+        failed_batches = 0
+
+        print(
+            f"\n>>> [Schema Validation] 全量复核 {len(texts)} 个 chunk、"
+            f"{len(dimensions)} 个候选维度（不写标签）..."
+        )
+        for start in tqdm(range(0, len(texts), batch_size), desc="全量 schema 复核"):
+            records = [
+                {"doc_id": str(start + offset), "doc_text": text}
+                for offset, text in enumerate(texts[start:start + batch_size])
+            ]
+            try:
+                # 使用 Schema 专用探针，仅作为“是否存在维度证据”的判断，结果不落库。
+                result = self.miner.validate_dimension_schema_batch(
+                    records, dimensions, max_text_chars=max_chars
+                )
+            except Exception as exc:
+                failed_batches += 1
+                print(f"  [Warning] schema 复核批次失败 start={start}: {exc}")
+                continue
+
+            for record in records:
+                tag_map = result.get(record["doc_id"], {}) if isinstance(result, dict) else {}
+                for dim in dimensions:
+                    raw_values = tag_map.get(dim, []) if isinstance(tag_map, dict) else []
+                    if isinstance(raw_values, str):
+                        raw_values = [raw_values]
+                    values = [str(value).strip() for value in (raw_values or []) if str(value).strip()]
+                    if values:
+                        covered[dim] += 1
+                        values_by_dim[dim].extend(values)
+
+        diagnostics = {}
+        for dim in dimensions:
+            values = values_by_dim[dim]
+            diagnostics[dim] = {
+                "covered_chunks": covered[dim],
+                "total_chunks": len(texts),
+                "coverage": round(covered[dim] / len(texts), 4),
+                "value_count": len(values),
+                "unique_values": len(set(values)),
+                "normalized_entropy": round(_normalized_entropy(values), 4),
+                "validation_chars": max_chars,
+                "validation_scope": "all_chunks",
+            }
+
+        self.dimension_diagnostics.update(diagnostics)
+        output = {
+            "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "docs_source": str(self.docs_source),
+            "total_chunks": len(texts),
+            "failed_batches": failed_batches,
+            "thresholds": {
+                "coverage": TH_COV,
+                "normalized_entropy": TH_DIS,
+                "difference": TH_DIFF,
+            },
+            "dimensions": diagnostics,
+            "core_dimensions": dimensions,
+            "note": (
+                "全量 schema 复核只用于判断维度名称是否有证据和区分度；"
+                "不生成、不写入任何 chunk 标签。"
+            ),
+        }
+        with open(PATH_DIM_DIAGNOSTICS, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        print(f"全量 schema 复核结果已保存至: {PATH_DIM_DIAGNOSTICS}")
+        return diagnostics
 
     def _handle_decision(self, dim, decision, dims_to_remove, new_dims_added, verified_dims,
                           candidates_for_merge=None):
@@ -777,18 +983,20 @@ class DimensionMiner:
         elif action == "KEEP":
             verified_dims.add(dim)
         elif action == "NOT_MERGE":
-            # merge_with_targets 返回 NOT_MERGE = 无法合并，强制删除
-            dims_to_remove.add(dim)
+            # “没有合适的合并目标”不等于“维度没有价值”。保留该维度，
+            # 避免稀疏但有检索价值的维度因合并失败被误删。
+            verified_dims.add(dim)
         elif action in ("RENAME", "SPLIT", "MERGE"):
             dims_to_remove.add(dim)
             new_dims_added.extend(new_dims)
 
 
-def run_step1(docs_source: str = "rdb"):
+def run_step1(docs_source: str = "rdb", validate_all: bool = False):
     """执行 Step 1: 维度挖掘（支持 MySQL 或 chunks 文件）
 
     Args:
         docs_source: "rdb" 或 chunks JSON 文件/目录路径
+        validate_all: 是否在核心维度确定后，对全量 chunk 做 schema 复核；只记录诊断，不写标签
     """
     print("=" * 60)
     src_label = "MySQL" if docs_source == "rdb" else str(docs_source)
@@ -805,6 +1013,9 @@ def run_step1(docs_source: str = "rdb"):
 
     # Step 3: 迭代优化
     V_core = miner.step3_iterative_optimization(V_cand)
+
+    if validate_all:
+        miner.validate_schema_on_all_chunks(V_core)
 
     print("\n" + "=" * 60)
     print("维度挖掘完成!")
@@ -1221,12 +1432,14 @@ def main():
                         help="Step 3 专用：只处理指定的 doc_id 列表（默认全量）")
     parser.add_argument("--docs_source", default="rdb",
                         help="Step 1/3 的数据源：'rdb'（MySQL）或 chunks JSON 文件/目录路径")
+    parser.add_argument("--validate_all", action="store_true",
+                        help="Step 1 完成后对全量 chunk 复核维度 schema（不生成、不写入标签）")
 
     args = parser.parse_args()
 
     # 强制模式：删除断点文件
     if args.force:
-        for f in [PATH_V_CAND, PATH_V_CORE, PATH_TAGS]:
+        for f in [PATH_V_CAND, PATH_V_CORE, PATH_TAGS, PATH_DIM_DIAGNOSTICS]:
             if f.exists():
                 f.unlink()
                 print(f"已删除: {f}")
@@ -1235,7 +1448,7 @@ def main():
 
     if args.step:
         if args.step == 1:
-            run_step1(docs_source=docs_source)
+            run_step1(docs_source=docs_source, validate_all=args.validate_all)
         elif args.step == 2:
             run_step2()
         elif args.step == 3:
@@ -1249,7 +1462,7 @@ def main():
         print("开始执行完整流程: Step 1 -> 2 -> 3 -> 4")
         print("=" * 60)
 
-        dims = run_step1(docs_source=docs_source)
+        dims = run_step1(docs_source=docs_source, validate_all=args.validate_all)
         run_step2()
         run_step3(docs_source=docs_source)
         run_step4()

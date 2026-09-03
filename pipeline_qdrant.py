@@ -20,6 +20,9 @@ RAG DB 流水线 - Qdrant 版本
   # 指定步骤范围
   python pipeline_qdrant.py --from_step 2 --to_step 6 --input ./data_input/test_data
 
+  # Step 5a 完成后全量复核维度 schema（不生成、不写入 chunk 标签）
+  python pipeline_qdrant.py --step 5 --chunks_file ./output_chunks/all_chunks_resolved.json --validate_schema_all
+
 作者: Qdrant 版本
 日期: 2026-05-29
 """
@@ -38,22 +41,6 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from db_config import get_config
-
-
-sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(project_root / "code"))
-from dimension_integration import (
-    DimensionMiner,
-    TagGenerator,
-    normalize_attr_key,
-    load_docs_from_rdb,
-    connect_rdb,
-    ensure_rdb_db,
-    fetch_rdb_columns,
-    PATH_V_CORE,
-    PATH_V_CAND,
-    PATH_TAGS,
-)
 
 
 class Pipeline:
@@ -440,8 +427,19 @@ class Pipeline:
             print(f"[Error] 指代消解失败: returncode={result.returncode}")
             return {"error": "指代消解失败"}
 
-        resolved_file = output_dir / "all_chunks_resolved.json"
-        log_file = output_dir / "all_chunks_resolution_log.json"
+        # coreference_resolver 按输入文件 stem 生成输出，例如：
+        # all_chunks_chunks.json -> all_chunks_chunks_resolved.json。
+        # 这里必须返回真实存在的文件，才能让后续 Step 4/6 继续使用消解结果。
+        resolved_file = output_dir / f"{chunks_path.stem}_resolved.json"
+        log_file = output_dir / f"{chunks_path.stem}_resolution_log.json"
+        if not resolved_file.exists():
+            # 兼容旧版本 resolver 的固定命名。
+            legacy_resolved = output_dir / "all_chunks_resolved.json"
+            legacy_log = output_dir / "all_chunks_resolution_log.json"
+            if legacy_resolved.exists():
+                resolved_file = legacy_resolved
+            if legacy_log.exists():
+                log_file = legacy_log
 
         print(f"\n  -> 指代消解完成")
         print(f"  输出文件: {resolved_file}")
@@ -738,6 +736,7 @@ class Pipeline:
             di.PATH_V_CAND = di.DATA_DIR / f"V_cand_{dataset}.json"
             di.PATH_V_CORE = di.DATA_DIR / f"V_core_{dataset}.json"
             di.PATH_TAGS = di.DATA_DIR / f"tags_output_{dataset}.json"
+            di.PATH_DIM_DIAGNOSTICS = di.DATA_DIR / f"dimension_diagnostics_{dataset}.json"
 
         print("\n[5a] 维度挖掘...")
         dims = self._dimension_mining(docs_source=_5a_source)
@@ -817,6 +816,7 @@ class Pipeline:
             docs_source: 数据源（'rdb' 或 chunks 文件/目录路径）
         """
         print("  [5a-1] 使用 DimensionMiner 进行维度挖掘...")
+        from dimension_integration import DimensionMiner
 
         miner = DimensionMiner(docs_source=docs_source)
 
@@ -828,6 +828,15 @@ class Pipeline:
 
         print("  [5a-4] 迭代优化...")
         v_core = miner.step3_iterative_optimization(v_cand)
+
+        # 可选的全量 schema 复核只用于评估“维度名称是否有证据和区分度”，
+        # 不生成、不写入 chunk 标签；正式标签仍由后续 _generate_tags 独立完成。
+        validate_schema_all = bool(getattr(self.args, "validate_schema_all", False)) or (
+            os.getenv("DIM_VALIDATE_ALL", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if validate_schema_all:
+            print("  [5a-5] 全量复核维度 schema（不写标签）...")
+            miner.validate_schema_on_all_chunks(v_core)
 
         return v_core
 
@@ -849,6 +858,7 @@ class Pipeline:
             candidates.extend([
                 experiment_data_dir / f"V_cand_{dataset}.json",
                 experiment_data_dir / f"V_core_{dataset}.json",
+                experiment_data_dir / f"dimension_diagnostics_{dataset}.json",
                 experiment_data_dir / f"tags_output_{dataset}.json",
                 experiment_data_dir / f"step5_result_{dataset}.json",
             ])
@@ -856,6 +866,7 @@ class Pipeline:
             candidates.extend([
                 experiment_data_dir / "V_cand.json",
                 experiment_data_dir / "V_core.json",
+                experiment_data_dir / "dimension_diagnostics.json",
                 experiment_data_dir / "tags_output.json",
                 experiment_data_dir / "step5_result.json",
             ])
@@ -881,6 +892,7 @@ class Pipeline:
 
     def _load_all_chunks_from_rdb(self, limit: int = 10000) -> List[Dict]:
         """从 MySQL 加载所有 chunk"""
+        from dimension_integration import load_docs_from_rdb
         docs = load_docs_from_rdb()
         return [{"doc_id": d["id"], "doc_text": d["text"]} for d in docs[:limit]]
 
@@ -944,7 +956,7 @@ class Pipeline:
                 try:
                     with open(jf, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    parsed = self._parse_chunks_data(data, src_label=str(jf))
+                    parsed = self._flatten_file_chunk_data(data, src_label=str(jf))
                     merged.extend(parsed)
                 except Exception as e:
                     print(f"    [Warning] 跳过 {jf.name}: {e}")
@@ -957,14 +969,102 @@ class Pipeline:
         # 单文件分支
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        chunks = self._parse_chunks_data(data, src_label=str(path))
+        chunks = self._flatten_file_chunk_data(data, src_label=str(path))
         if limit and len(chunks) > limit:
             chunks = chunks[:limit]
         print(f"    [chunks_file] 从 {path.name} 加载 {len(chunks)} 条")
         return chunks
 
+    def _flatten_file_chunk_data(self, data: Any, src_label: str = "<data>") -> List[Dict]:
+        """将层级分片文件展开为逐 chunk 记录，并保留入库所需元数据。
+
+        Step 5 必须以 chunk 为单位抽取标签，Step 6 也必须用相同的
+        chunk_id 进行关联。因此这里统一生成形如 ``base_sub_000`` 的
+        ID，避免原先把一个文档的全文当成一条标签记录。
+        """
+        if isinstance(data, list) and data and any(
+            isinstance(item, dict) and "chunks" in item for item in data
+        ):
+            output: List[Dict] = []
+            for sub in data:
+                if not isinstance(sub, dict):
+                    continue
+                base_id = str(sub.get("doc_id") or sub.get("file_name") or "unknown")
+                file_name = str(sub.get("file_name") or base_id)
+                genre = sub.get("genre", "doc")
+                l_min = sub.get("l_min", 0)
+                l_max = sub.get("l_max", 0)
+                corpus_id = sub.get("corpus_id") or file_name
+                base_profile = sub.get("profile_json", {})
+                if isinstance(base_profile, str):
+                    try:
+                        base_profile = json.loads(base_profile)
+                    except Exception:
+                        base_profile = {}
+                if not isinstance(base_profile, dict):
+                    base_profile = {}
+
+                for index, chunk in enumerate(sub.get("chunks") or []):
+                    if not isinstance(chunk, dict):
+                        continue
+                    text = chunk.get("chunk_text") or chunk.get("text") or chunk.get("content") or ""
+                    if not text:
+                        continue
+                    chunk_id = str(chunk.get("chunk_id") or f"{base_id}_sub_{index:03d}")
+                    profile = dict(base_profile)
+                    profile.update({
+                        "file_name": file_name,
+                        "genre": genre,
+                        "l_min": l_min,
+                        "l_max": l_max,
+                        "chunk_index": chunk.get("chunk_index", index),
+                    })
+                    output.append({
+                        "doc_id": chunk_id,
+                        "corpus_id": corpus_id,
+                        "doc_text": str(text),
+                        "genre": genre,
+                        "l_min": l_min,
+                        "l_max": l_max,
+                        "chunk_index": chunk.get("chunk_index", index),
+                        "file_name": file_name,
+                        "profile_json": profile,
+                    })
+            return output
+
+        # 扁平格式仍保留原有兼容性，同时尽量保留原始字段。
+        if isinstance(data, dict):
+            for key in ("chunks", "documents", "docs", "data", "items"):
+                if key in data and isinstance(data[key], list):
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            raise ValueError(f"无法识别 {src_label} 的 JSON 结构")
+
+        output = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            doc_id = item.get("id") or item.get("doc_id") or item.get("docid") or f"chunk_{i:06d}"
+            text = item.get("text") or item.get("doc_text") or item.get("content") or item.get("chunk_text")
+            if text is None:
+                continue
+            record = dict(item)
+            record["doc_id"] = str(doc_id)
+            record["doc_text"] = str(text)
+            profile = record.get("profile_json", {})
+            if isinstance(profile, str):
+                try:
+                    profile = json.loads(profile)
+                except Exception:
+                    profile = {}
+            record["profile_json"] = profile if isinstance(profile, dict) else {}
+            output.append(record)
+        return output
+
     def _add_dimension_columns(self, dims: List[str]) -> Dict[str, int]:
         """添加维度列到 MySQL"""
+        from dimension_integration import ensure_rdb_db, connect_rdb, normalize_attr_key
         ensure_rdb_db()
 
         conn = connect_rdb()
@@ -1059,35 +1159,59 @@ class Pipeline:
             print(f"    去重: {len(chunks)} 条 -> {len(unique_chunks)} 条")
 
         processed = 0
-        for i, chunk in enumerate(unique_chunks):
+        # 对断点文件中已有的标签也做证据过滤，避免早期批量请求把相邻
+        # chunk 的实体串入当前 chunk 后被永久保留。
+        chunk_text_map = {chunk["doc_id"]: chunk["doc_text"] for chunk in unique_chunks}
+        for doc_id, tag_map in list(results.items()):
+            if doc_id in chunk_text_map and isinstance(tag_map, dict):
+                results[doc_id] = self._filter_dimension_tags(
+                    chunk_text_map[doc_id], tag_map, allowed_dims=dims
+                )
+
+        pending = []
+        for chunk in unique_chunks:
             doc_id = chunk["doc_id"]
             if doc_id in results:
                 continue
-
-            text = chunk["doc_text"]
-            if not text or len(text) < 10:
+            if not chunk["doc_text"] or len(chunk["doc_text"]) < 10:
                 results[doc_id] = {}
                 continue
+            pending.append(chunk)
 
+        try:
+            batch_size = max(1, min(50, int(os.getenv("LLM_TAG_BATCH_SIZE", "20"))))
+        except ValueError:
+            batch_size = 20
+        try:
+            tag_text_chars = max(0, int(os.getenv("LLM_TAG_TEXT_CHARS", "2000")))
+        except ValueError:
+            tag_text_chars = 2000
+        total_pending = len(pending)
+        print(
+            f"    待抽取 {total_pending} 条，批量大小={batch_size}，"
+            f"单 chunk 最多读取 {tag_text_chars or '不限'} 字（每批一次 LLM 请求）"
+        )
+
+        for start in range(0, total_pending, batch_size):
+            batch = pending[start:start + batch_size]
             try:
-                extracted = miner.extract_batch_dimensions(text, dims)
-                if extracted:
-                    results[doc_id] = extracted
-                else:
-                    keywords = miner.extract_keywords_fallback(text)
-                    if keywords:
-                        results[doc_id] = {"其他": keywords}
-                    else:
-                        results[doc_id] = {}
+                extracted_batch = miner.extract_multi_chunk_dimensions(
+                    batch, dims, max_text_chars=tag_text_chars
+                )
             except Exception as e:
-                print(f"    [Error] {doc_id}: {e}")
-                results[doc_id] = {}
+                print(f"    [Error] 批量标签请求失败（{start + 1}-{start + len(batch)}）: {e}")
+                extracted_batch = {}
 
-            processed += 1
-            if processed % 50 == 0:
-                print(f"    已处理 {processed}/{len(chunks) - len(results)} ...")
-                with open(tags_output_path, "w", encoding="utf-8") as f:
-                    json.dump(results, f, ensure_ascii=False)
+            for chunk in batch:
+                doc_id = chunk["doc_id"]
+                results[doc_id] = self._filter_dimension_tags(
+                    chunk["doc_text"], extracted_batch.get(doc_id, {}), allowed_dims=dims
+                )
+
+            processed += len(batch)
+            print(f"    已处理 {processed}/{total_pending} ...")
+            with open(tags_output_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False)
 
         with open(tags_output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False)
@@ -1095,8 +1219,61 @@ class Pipeline:
         print(f"    标签生成完成，共 {len(results)} 条")
         return results
 
+    @staticmethod
+    def _filter_dimension_tags(
+        text: str,
+        tag_map: Dict[str, Any],
+        allowed_dims: Optional[List[str]] = None,
+    ) -> Dict[str, List[str]]:
+        """只保留能在当前 chunk 中找到文本证据的标签。
+
+        LLM 批量抽取时可能发生跨记录串值。严格保留原文子串，另外对
+        少量同义/格式化差异允许较高比例的汉字重合，优先保证标签不被
+        其他 chunk 的实体污染。
+        """
+        if not text or not isinstance(tag_map, dict):
+            return {}
+        text = str(text)
+        allowed = {str(dim).strip() for dim in (allowed_dims or []) if str(dim).strip()}
+        filtered: Dict[str, List[str]] = {}
+        for dim, values in tag_map.items():
+            dim = str(dim).strip()
+            if dim.startswith("dim_") and dim[4:] in allowed:
+                dim = dim[4:]
+            if allowed and dim not in allowed:
+                continue
+            if not values:
+                continue
+            if isinstance(values, str):
+                values = [values]
+            kept = []
+            for value in values:
+                value = str(value).strip()
+                if not value:
+                    continue
+                if value in text:
+                    kept.append(value)
+                    continue
+                # 允许标点、括号或轻微格式差异，但至少要有 3 个有效汉字，
+                # 且其中 75% 在当前 chunk 出现。
+                chars = {c for c in value if "\u4e00" <= c <= "\u9fff"}
+                if len(chars) >= 3:
+                    overlap = sum(c in text for c in chars) / len(chars)
+                    if overlap >= 0.75:
+                        kept.append(value)
+            if kept:
+                filtered[dim] = list(dict.fromkeys(kept))
+        return filtered
+
     def _write_tags_to_rdb(self, tags_result: Dict[str, Dict[str, List[str]]], dims: List[str] = None, dataset: str = None) -> Dict[str, int]:
         """将标签写入 MySQL（支持按数据集隔离维度文件）"""
+        from dimension_integration import (
+            ensure_rdb_db,
+            fetch_rdb_columns,
+            normalize_attr_key,
+            connect_rdb,
+            PATH_V_CORE,
+        )
         if not tags_result:
             print("    无标签数据，跳过写入")
             return {"updated": 0, "cleaned": 0}
@@ -1247,7 +1424,6 @@ class Pipeline:
         """
         from collections import defaultdict
         import pickle
-        from FlagEmbedding import BGEM3FlagModel
 
         experiment_data_dir = project_root / "experiment_data"
         experiment_data_dir.mkdir(exist_ok=True)
@@ -1352,12 +1528,23 @@ class Pipeline:
             import torch
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             print(f"  使用设备: {device}")
-            encoder = BGEM3FlagModel(embedding_model_path, use_fp16=(device == 'cuda'), device=device)
+            try:
+                from FlagEmbedding import BGEM3FlagModel
+                encoder = BGEM3FlagModel(embedding_model_path, use_fp16=(device == 'cuda'), device=device)
+                encode_values = lambda values: encoder.encode(values, return_dense=True)['dense_vecs']
+            except ImportError:
+                # 维度索引不是文件直入 Qdrant 的必需项；若只安装了
+                # sentence-transformers，则使用同一 BGE-M3 模型作兼容回退。
+                from sentence_transformers import SentenceTransformer
+                encoder = SentenceTransformer(embedding_model_path, local_files_only=True)
+                encode_values = lambda values: encoder.encode(
+                    values, normalize_embeddings=True, show_progress_bar=False
+                )
             tag_vectors = {}
 
             for dim, val_list in dims_to_vectorize:
                 print(f"    Encoding {dim} ({len(val_list)} values)...")
-                embeddings = encoder.encode(val_list, return_dense=True)['dense_vecs']
+                embeddings = encode_values(val_list)
                 tag_vectors[dim] = {
                     "values": val_list,
                     "vectors": embeddings,
@@ -1385,6 +1572,102 @@ class Pipeline:
             "dim_metadata": str(meta_path),
         }
 
+    @staticmethod
+    def _dimension_payload_key(dim_name: str) -> str:
+        """把维度名称统一转换为 MySQL/Qdrant 共用的 dim_* 字段名。"""
+        key = str(dim_name or "").strip().lower()
+        key = key.replace(" ", "_").replace("-", "_")
+        key = "".join(c for c in key if c.isalnum() or c == "_")
+        if not key:
+            return ""
+        if not key.startswith("dim_"):
+            key = "dim_" + key
+        return key[:64]
+
+    @staticmethod
+    def _dimension_payload_value(value: Any) -> str:
+        """将标签列表转换为与 MySQL 维度列一致的字符串值。"""
+        if isinstance(value, (list, tuple, set)):
+            return "; ".join(str(v).strip() for v in value if str(v).strip())
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value).strip() if value is not None else ""
+
+    @classmethod
+    def _payload_safe_value(cls, value: Any) -> Any:
+        """将数据库对象转换成 Qdrant payload 可序列化的值。"""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): cls._payload_safe_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [cls._payload_safe_value(v) for v in value]
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
+    def _load_dimension_tags_for_qdrant(self) -> Dict[str, Dict[str, List[str]]]:
+        """加载 Step 5 产物，返回 {chunk_id: {dimension: tags}}。
+
+        文件直入模式没有 MySQL 可供 Step 6 读取，因此优先使用当前
+        dataset 对应的 tags_output；若不存在，再读取 step5_result 中
+        嵌套保存的 tags_result。不会自动混用其他数据集的标签文件。
+        """
+        experiment_data_dir = project_root / "experiment_data"
+        dataset = getattr(self.args, "dataset", "") if self.args else ""
+        names = []
+        if dataset:
+            names.extend([
+                experiment_data_dir / f"tags_output_{dataset}.json",
+                experiment_data_dir / f"step5_result_{dataset}.json",
+            ])
+        else:
+            names.extend([
+                experiment_data_dir / "tags_output.json",
+                experiment_data_dir / "step5_result.json",
+            ])
+
+        for path in names:
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("tags_result"), dict):
+                    data = data["tags_result"]
+                if isinstance(data, dict):
+                    print(f"  [6b-1] 读取维度标签: {path}")
+                    return data
+            except Exception as e:
+                print(f"  [Warning] 读取标签文件失败 {path}: {e}")
+        return {}
+
+    def _merge_dimension_tags_into_chunks(
+        self,
+        chunks_data: List[Dict[str, Any]],
+        tag_result: Dict[str, Dict[str, List[str]]],
+    ) -> int:
+        """把 Step 5 的标签合并到对应 chunk 的 dim_* 字段。"""
+        if not tag_result:
+            return 0
+
+        matched = 0
+        for chunk in chunks_data:
+            doc_id = str(chunk.get("doc_id", ""))
+            tags = tag_result.get(doc_id)
+            if not isinstance(tags, dict):
+                continue
+            chunk_matched = False
+            for dim_name, values in tags.items():
+                key = self._dimension_payload_key(dim_name)
+                value = self._dimension_payload_value(values)
+                if key and value:
+                    chunk[key] = value
+                    chunk_matched = True
+            if chunk_matched:
+                matched += 1
+        return matched
+
     def _migrate_to_qdrant(self) -> Dict[str, Any]:
         """全量迁移到 Qdrant
 
@@ -1393,42 +1676,69 @@ class Pipeline:
         - payload 存储所有元数据（无需预定义 Schema）
         - 中文列名直接存储，无需转拼音
         """
-        print("  [6b-1] 加载 MySQL 全量数据...")
+        source_chunks_file = getattr(self.args, "chunks_file", "") if self.args else ""
+        if source_chunks_file:
+            print(f"  [6b-1] 从分片文件加载数据: {source_chunks_file}")
+            try:
+                chunks_data = self._load_qdrant_chunks_from_file(source_chunks_file)
+            except Exception as e:
+                print(f"  [Error] 分片文件加载失败: {e}")
+                return {"error": str(e)}
+        else:
+            print("  [6b-1] 加载 MySQL 全量数据...")
+            conn = self._connect_rdb()
+            cur = conn.cursor()
+            try:
+                database = self.config.rdb.database
+                table = self.config.rdb.table
+                cur.execute(f"USE `{database}`")
+                cur.execute(f"SELECT * FROM `{table}`")
+                rows = cur.fetchall()
+                col_names = [row[0] for row in cur.description]
 
-        conn = self._connect_rdb()
-        cur = conn.cursor()
-        try:
-            database = self.config.rdb.database
-            table = self.config.rdb.table
-            cur.execute(f"USE `{database}`")
-            cur.execute(f"SELECT * FROM `{table}`")
-            rows = cur.fetchall()
-            col_names = [row[0] for row in cur.description]
+                chunks_data = []
+                for row in rows:
+                    row_dict = dict(zip(col_names, row))
+                    chunks_data.append(row_dict)
 
-            chunks_data = []
-            for row in rows:
-                row_dict = dict(zip(col_names, row))
-                chunks_data.append(row_dict)
+                print(f"  [6b-1] 加载 {len(chunks_data)} 条数据")
 
-            print(f"  [6b-1] 加载 {len(chunks_data)} 条数据")
-
-        except Exception as e:
-            print(f"  [Error] 加载失败: {e}")
-            return {"error": str(e)}
-        finally:
-            cur.close()
-            conn.close()
+            except Exception as e:
+                print(f"  [Error] 加载失败: {e}")
+                return {"error": str(e)}
+            finally:
+                cur.close()
+                conn.close()
 
         if not chunks_data:
             print("  [Warning] 无数据，跳过迁移")
             return {"inserted": 0}
 
+        # 文件直入模式下，Step 5 的标签结果不会出现在原始分片 JSON 中，
+        # 这里显式读取并合并为 dim_* payload 字段，保证 Qdrant 与 MySQL
+        # 的维度列语义一致。
+        if source_chunks_file:
+            tag_result = self._load_dimension_tags_for_qdrant()
+            matched_chunks = self._merge_dimension_tags_into_chunks(chunks_data, tag_result)
+            if tag_result:
+                print(f"  [6b-1] 已加载 {len(tag_result)} 条标签记录，匹配到 {matched_chunks}/{len(chunks_data)} 个 chunk")
+            else:
+                print("  [6b-1] 未找到 Step 5 标签文件，本次仅迁移基础字段")
+
         print("  [6b-2] 加载 Embedding 模型...")
         self._get_embedding_model()
 
-        print("  [6b-3] 编码向量并构建 payload...")
+        print("  [6b-3] 批量编码向量并构建 payload...")
 
-        points = []
+        all_dimension_keys = sorted({
+            key for chunk in chunks_data
+            for key in chunk.keys()
+            if isinstance(key, str) and key.startswith("dim_")
+        })
+        if all_dimension_keys:
+            print(f"  [6b-3] 维度字段: {len(all_dimension_keys)} 个")
+
+        prepared = []
         for i, chunk in enumerate(chunks_data):
             doc_id = chunk.get("doc_id", f"chunk_{i}")
             doc_text = chunk.get("doc_text", "")
@@ -1445,13 +1755,21 @@ class Pipeline:
             doc_title = profile.get("file_name", doc_id)
             chunk_title = doc_title[:80]
 
-            # 构建 payload（Qdrant 支持动态字段）
+            # 构建 payload（Qdrant 支持动态字段）。
+            # chunk_text_vec 对应 chunk 内容向量；其余字段为 MySQL/RDB
+            # 中的基础字段和维度列。
             payload = {
                 "chunk_id": doc_id,
+                "doc_id": doc_id,
                 "doc_id_link": doc_id,
                 "doc_title": doc_title,
                 "chunk_gen_title": chunk_title,
-                "chunk_text": doc_text[:5000],
+                # payload 保留完整 chunk 文本；仅向量编码按当前 BGE-M3
+                # 约定截取前 2000 字符，避免输入超过模型长度限制。
+                "chunk_text": doc_text,
+                "doc_text": doc_text,
+                "corpus_id": chunk.get("corpus_id", ""),
+                "profile_json": profile,
                 "chunk_index": profile.get("chunk_index", i),
                 "chunk_up_cid": "",
                 "chunk_down_cid": "",
@@ -1461,19 +1779,38 @@ class Pipeline:
                 "l_max": profile.get("l_max", 0),
             }
 
-            # 添加维度列到 payload
+            # 保留输入记录中的其他 MySQL 字段；维度字段统一转为
+            # dim_*，多标签使用与 MySQL 相同的分号连接格式。
             for key, val in chunk.items():
-                if key.startswith("dim_") and val:
-                    payload[key] = val
+                if key in {"doc_id", "doc_text", "profile_json"}:
+                    continue
+                if val is None:
+                    continue
+                payload[key] = self._payload_safe_value(val)
+
+            # 维度列即使当前 chunk 没有标签也保留为空，便于检查 schema
+            # 和后续按字段过滤。
+            for key in all_dimension_keys:
+                payload.setdefault(key, "")
+
+            prepared.append((doc_id, doc_text, doc_title, chunk_title, payload))
+
+        doc_title_vecs = self._encode_texts([item[2] for item in prepared])
+        chunk_title_vecs = self._encode_texts([item[3] for item in prepared])
+        chunk_text_vecs = self._encode_texts([item[1][:2000] for item in prepared])
+
+        points = []
+        for i, item in enumerate(prepared):
+            _doc_id, _doc_text, _doc_title, _chunk_title, payload = item
 
             # 多向量
             from qdrant_client.models import PointStruct
             point = PointStruct(
                 id=i,
                 vector={
-                    "doc_title_vec": self._encode_text(doc_title),
-                    "chunk_title_vec": self._encode_text(chunk_title),
-                    "chunk_text_vec": self._encode_text(doc_text[:2000]),
+                    "doc_title_vec": doc_title_vecs[i],
+                    "chunk_title_vec": chunk_title_vecs[i],
+                    "chunk_text_vec": chunk_text_vecs[i],
                 },
                 payload=payload,
             )
@@ -1562,6 +1899,21 @@ class Pipeline:
             "payload_fields": payload_field_count,
         }
 
+    def _load_qdrant_chunks_from_file(self, chunks_file: str) -> List[Dict[str, Any]]:
+        """读取流水线生成的层级分片 JSON，转换成 Qdrant 迁移格式。
+
+        文件直入模式使用 Step 3 的 resolved JSON（若存在），因此不依赖 MySQL。
+        同时兼容扁平的 [{id, text}] / [{doc_id, doc_text}] 文件。
+        """
+        path = Path(chunks_file)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        output = self._flatten_file_chunk_data(data, src_label=str(path))
+        print(f"  [6b-1] 从分片文件加载 {len(output)} 条数据")
+        return output
+
     # ==================== run ====================
 
     def run(
@@ -1643,9 +1995,11 @@ class Pipeline:
                 6: self.args.skip_step6,
             }
 
+            current_chunks_file = chunks_file or ""
+            write_chunks_file = current_chunks_file
             resolved_chunks = str(project_root / "output_chunks" / "all_chunks_resolved.json")
-            write_chunks_file = chunks_file
             if not write_chunks_file and Path(resolved_chunks).exists():
+                current_chunks_file = resolved_chunks
                 write_chunks_file = resolved_chunks
 
             results = {}
@@ -1657,8 +2011,12 @@ class Pipeline:
                     results[1] = self.step1_init_db(force=force)
                 elif s == 2:
                     results[2] = self.step2_chunking(input_path=input_path)
+                    current_chunks_file = results[2].get("chunks_file", current_chunks_file)
+                    write_chunks_file = current_chunks_file
                 elif s == 3:
-                    results[3] = self.step3_coreference_resolution(chunks_file=chunks_file)
+                    results[3] = self.step3_coreference_resolution(chunks_file=current_chunks_file or None)
+                    current_chunks_file = results[3].get("resolved_file", current_chunks_file)
+                    write_chunks_file = current_chunks_file
                 elif s == 4:
                     results[4] = self.step4_write_to_rdb(
                         chunks_file=write_chunks_file,
@@ -1666,7 +2024,7 @@ class Pipeline:
                         force=force,
                     )
                 elif s == 5:
-                    _step5_chunks = getattr(self.args, 'chunks_file', '') or None
+                    _step5_chunks = current_chunks_file or None
                     _step5_docs_source = getattr(self.args, 'docs_source', '') or None
                     results[5] = self.step5_dimension_tagging(
                         dataset=dataset,
@@ -1676,6 +2034,9 @@ class Pipeline:
                         docs_source=_step5_docs_source,
                     )
                 elif s == 6:
+                    # Step 6 在传入文件时直接从分片 JSON 迁移到 Qdrant，
+                    # 否则保持原有的 MySQL 全量迁移行为。
+                    self.args.chunks_file = current_chunks_file or ""
                     results[6] = self.step6_build_index_and_migrate()
 
             print(f"\n{'=' * 60}")
@@ -1744,6 +2105,8 @@ def main():
                         help="数据集标识名（用于隔离 tags_output_{dataset}.json 和 V_core_{dataset}.json，缺省则用默认文件）")
     parser.add_argument("--docs_source", default="",
                         help="Step 5 数据源（'rdb' 或 chunks JSON 文件/目录路径；缺省时若 --chunks_file 给出则使用它，否则使用 MySQL）")
+    parser.add_argument("--validate_schema_all", action="store_true",
+                        help="Step 5a 完成后全量复核维度 schema（只写诊断，不生成、不写入 chunk 标签）")
 
     args = parser.parse_args()
 

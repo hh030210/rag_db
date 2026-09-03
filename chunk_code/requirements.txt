@@ -1,0 +1,10 @@
+# Core dependencies (pure Python standard library, no install needed)
+# The integrated_chunker.py core works with Python 3.10+ standard library only.
+
+# Optional: for calling LLM APIs (uses urllib from stdlib)
+# No additional packages needed.
+
+# Optional: for LocalHuggingFacePPLScorer (GPU-accelerated PPL calculation)
+# Uncomment the following to install:
+# torch>=2.0.0
+# transformers>=4.30.0

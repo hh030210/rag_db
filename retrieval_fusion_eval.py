@@ -20,6 +20,8 @@ import sys
 import os
 import json
 import pickle
+import math
+import re
 import threading
 import time as _time
 from pathlib import Path
@@ -86,7 +88,15 @@ class SearchConfig:
     VECTOR_TOP_K = 200
     RRF_K = 60
     DEFAULT_ALPHA = 0.2
-    SOFT_MATCH_THRESHOLD = 0.65
+    # 向量兜底只在同一维度内生效；精确/别名命中不受该阈值限制。
+    SOFT_MATCH_THRESHOLD = 0.58
+    DIM_TAG_SIM_THRESHOLD = 0.58
+    DIM_TAG_MARGIN = 0.04
+    DIM_TAG_TOP_K_PER_DIM = 5
+    DIM_MAX_ACTIVE_DIMS = 3
+    DIM_ENTITY_BONUS = 0.12
+    DIM_COVERAGE_BONUS = 0.08
+    SPOT_FILTER_POOL_MULTIPLIER = 5
     SEM_TOP_K = 20
     DIM_TOP_K = 100
     EXCLUDED_DIMS: Set[str] = set()
@@ -120,6 +130,15 @@ class _QdrantClient:
         r = httpx.post(self.base + path, json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()
+
+    def collection_exists(self, collection: str) -> bool:
+        """检查 collection 是否存在，避免每条 query 重复触发 404 回退。"""
+        import httpx
+        try:
+            response = httpx.get(self.base + f"/collections/{collection}", timeout=5.0)
+            return response.is_success
+        except Exception:
+            return False
 
     def search(self, collection: str, query_vector: List[float],
                vector_name: str = "chunk_text_vec",
@@ -349,9 +368,10 @@ class DimensionAwareSearch:
     """
     维度感知检索器（Qdrant 实现）。
 
-    sem：直接在 rag_chunks 上做 chunk_text_vec 向量检索
-    dim：在 dimension_tags 上做向量检索，取 tag_name/dim_name，
-         再展开 chunk_ids 查 rag_chunks 取出全文，最后 RRF 融合
+    sem：直接在语料 collection 上做 chunk_text_vec 向量检索
+    dim：优先读取语料 point 的 dim_* payload 字段，按查询激活维度做
+         精确/别名匹配和同维度向量兜底，再展开 chunk_ids 取出全文。
+         外层问答流程负责一次归一化融合。
     """
 
     def __init__(self, collection_name: str = None):
@@ -361,6 +381,11 @@ class DimensionAwareSearch:
         print(f"    语料: {self.collection_name}  维度标签: {self.dim_tags_collection}")
 
         self.client = _QdrantClient(_qdrant_cfg["host"], _qdrant_cfg["port"])
+        self._dim_tags_collection_available = self.client.collection_exists(
+            self.dim_tags_collection
+        )
+        if not self._dim_tags_collection_available:
+            print("    独立维度标签 collection 不可用，将直接使用语料 payload 维度字段")
 
         # BGE-M3 编码器
         self.encoder = _load_bge_encoder()
@@ -371,7 +396,20 @@ class DimensionAwareSearch:
         self.inverted_index: Dict = {}
         self.dim_meta: Dict = {}
         self.tag_vectors: Dict = {}
+        # 新版 Qdrant 将维度标签直接写入 unified_corpus 的 dim_* payload
+        # 字段，不再强制依赖独立的 dimension_tags collection。
+        self._payload_dim_tags: Dict[str, Set[str]] = {}
+        self._payload_tag_points: Dict[tuple, Set[str]] = {}
+        self._payload_tags_by_chunk: Dict[str, list] = {}
+        self._payload_tag_vectors: Dict[tuple, list] = {}
+        self._payload_spot_by_chunk: Dict[str, str] = {}
+        self._payload_spot_chunks: Dict[str, Set[str]] = {}
+        self._payload_spot_entity_index: Dict[str, Set[str]] = {}
+        self._payload_spot_aliases: Dict[str, Set[str]] = {}
+        self._payload_index_loaded = False
+        self._payload_tag_vectors_loaded = False
         self._load_indexes()
+        self._load_payload_dimension_index()
 
     def _load_indexes(self):
         """加载本地倒排索引/维度元数据/标签向量（若存在则用于补充）"""
@@ -403,6 +441,514 @@ class DimensionAwareSearch:
             except Exception:
                 self.tag_vectors = {}
 
+    @staticmethod
+    def _split_payload_tags(value: Any) -> list[str]:
+        """解析 Qdrant dim_* 字段中的单值、多值和分号连接值。"""
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            value = list(value.values())
+        if isinstance(value, (list, tuple, set)):
+            raw_values = value
+        else:
+            raw_values = re.split(r"[;；]", str(value))
+        out = []
+        for item in raw_values:
+            text = str(item or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    # 查询分析使用的词典只负责“识别”，不负责直接决定答案。这样可以把
+    # 查询解析与召回结果解耦，避免先召回错误 chunk 再反向制造 constraints。
+    _DIMENSION_CUES = {
+        "历史沿革": "历史 始建 建于 营建 修建 发展 起源 年代 朝代 恢复 历时 过程 原因 为何 为什么 生前".split(),
+        "历史事件": "历史 始建 建于 营建 修建 发展 起源 年代 朝代 恢复 历时 过程 原因 为何 为什么".split(),
+        "建筑形制": "建筑 殿 门 塔 墙 桥 布局 结构 形制 规模 面积 米 石像生 神道 顺序 外观".split(),
+        "建筑功能": "建筑 殿 门 塔 墙 桥 布局 结构 用途 功能 祭祀 规模 面积".split(),
+        "功能用途": "用途 作用 功能 用于 干什么 做什么".split(),
+        "文化象征": "寓意 象征 意义 称号 为什么叫 名称由来 代表".split(),
+        "人物谱系": "谁 人物 皇帝 皇后 祖先 供奉 合葬 身份 哪位 相关人物".split(),
+        "涉及皇帝": "谁 皇帝 皇后 祖先 供奉 合葬 哪位".split(),
+        "相关人物": "谁 人物 皇帝 皇后 祖先 供奉 合葬 身份 哪位".split(),
+        "地理位置": "位于 哪里 位置 路线 交通 距离 附近 从哪里 地址 方位 地处".split(),
+        "行政区域": "位于 哪里 位置 行政 区县 城市 省市 地处".split(),
+        "景观特征": "景观 看点 景色 风景 特色 好看 景致 景物".split(),
+        "艺术类型": "艺术 雕刻 雕塑 书法 绘画 石刻 造像 艺术类型".split(),
+        "宗教内涵": "祭祀 祭孔 宗教 佛 道 供奉 典礼 儒学 礼制".split(),
+        "文献典籍": "典籍 论语 文献 书 记载 碑 文献记载".split(),
+        "游览服务": "门票 票价 票 预约 费用 收费 开放 服务 讲解 厕所 母婴 餐厅 吃饭 盖章 活动 电话".split(),
+        "交通路径类型": "路线 交通 道路 公交 地铁 自驾 怎么去 到达".split(),
+        "交通服务类型": "停车场 接驳 公交 观光车 交通 服务".split(),
+        "观光交通设施": "停车场 公交车 观光车 索道 缆车 游船 交通设施".split(),
+    }
+    _SPOT_ALIASES = {
+        "明十三陵": {"十三陵", "明十三陵", "十三陵景区"},
+        "南孔庙": {"南孔", "南孔庙", "孔氏南宗家庙", "南宗家庙", "衢州南孔庙", "衢州孔庙", "孔庙"},
+        "西湖": {"西湖", "杭州西湖"},
+        "丽江古城": {"丽江", "丽江古城"},
+        "西双版纳热带植物园": {"西双版纳", "西双版纳热带植物园", "热带植物园"},
+        "张家界": {"张家界", "张家界国家森林公园"},
+    }
+    _ENTITY_STOPWORDS = {
+        "为什么", "怎么", "如何", "哪个", "哪些", "什么", "是否", "可以", "景区", "景点",
+        "历史", "建筑", "功能", "用途", "位置", "地理", "文化", "艺术", "宗教", "典籍",
+        "服务", "交通", "相关", "分别", "介绍", "情况", "特点", "信息", "问题", "请问",
+    }
+
+    @staticmethod
+    def _normalize_match_text(text: Any) -> str:
+        """统一中文标签/别名匹配的大小写、空白和标点。"""
+        value = str(text or "").lower()
+        return re.sub(r"[\s\u3000，。！？；：、（）()【】\[\]{}‘’“”\"'·_-]+", "", value)
+
+    @classmethod
+    def _spot_from_payload(cls, payload: dict) -> str:
+        """优先读取显式景区字段，否则从文档标题稳定推导景区名。"""
+        for key in ("spot_name", "景区名称", "spot", "景区"):
+            value = payload.get(key)
+            if isinstance(value, (list, tuple, set)):
+                value = next(iter(value), "")
+            if value and str(value).strip():
+                return str(value).strip()
+        title = str(payload.get("doc_title") or payload.get("chunk_gen_title") or "").strip()
+        if not title:
+            return ""
+        first = re.split(r"[-—_|｜/:：]", title, maxsplit=1)[0].strip()
+        return re.sub(r"(?:景区|知识库|文档)$", "", first).strip()
+
+    @classmethod
+    def _canonical_spot(cls, spot: str) -> str:
+        normalized = cls._normalize_match_text(spot)
+        if not normalized:
+            return ""
+        for canonical, aliases in cls._SPOT_ALIASES.items():
+            if normalized == cls._normalize_match_text(canonical):
+                return canonical
+            if any(normalized == cls._normalize_match_text(alias) for alias in aliases):
+                return canonical
+        return str(spot).strip()
+
+    @classmethod
+    def _aliases_for_spot(cls, spot: str) -> set[str]:
+        canonical = cls._canonical_spot(spot)
+        aliases = set(cls._SPOT_ALIASES.get(canonical, set()))
+        if canonical:
+            aliases.add(canonical)
+            aliases.add(re.sub(r"(?:景区|国家森林公园)$", "", canonical))
+        return {item for item in aliases if item}
+
+    @classmethod
+    def _dimension_cue_score(cls, dim_name: str, query_text: str) -> int:
+        q = cls._normalize_match_text(query_text)
+        if not q:
+            return 0
+        cues = cls._DIMENSION_CUES.get(dim_name, [])
+        # 未收录的维度允许用维度名本身作弱线索，但不会凭空激活全部维度。
+        if not cues:
+            cues = [dim_name]
+        return sum(1 for cue in cues if cls._normalize_match_text(cue) in q)
+
+    def _register_entity_terms(self, text: str, spot: str):
+        """从标题、标签和短正文建立轻量实体->景区索引。"""
+        if not spot or not text:
+            return
+        runs = re.findall(r"[\u4e00-\u9fff]{2,}", str(text))
+        for run in runs:
+            limit = min(len(run), 8)
+            for size in (2, 3, 4):
+                if size > limit:
+                    continue
+                for start in range(0, len(run) - size + 1):
+                    term = run[start:start + size]
+                    if term in self._ENTITY_STOPWORDS:
+                        continue
+                    self._payload_spot_entity_index.setdefault(term, set()).add(spot)
+
+    def _load_payload_dimension_index(self):
+        """从语料 collection 的 dim_* payload 字段建立轻量维度倒排索引。
+
+        该索引兼容 Step 6 的新版入库方式：每个 chunk point 自带维度列，
+        因而维度检索可以直接由这些字段恢复 (dimension, tag) -> chunk_id。
+        """
+        if self._payload_index_loaded:
+            return
+        self._payload_index_loaded = True
+        try:
+            points = self.client.scroll(self.collection_name, limit=10000, with_payload=True)
+        except Exception as exc:
+            print(f"    [提示] 未能读取 Qdrant dim_* 字段: {exc}")
+            return
+
+        for point in points:
+            payload = point.get("payload") or {}
+            chunk_id = payload.get("chunk_id") or point.get("id")
+            if chunk_id is None:
+                continue
+            chunk_id = str(chunk_id)
+            spot = self._canonical_spot(self._spot_from_payload(payload))
+            if spot:
+                self._payload_spot_by_chunk[chunk_id] = spot
+                self._payload_spot_chunks.setdefault(spot, set()).add(chunk_id)
+                for alias in self._aliases_for_spot(spot):
+                    self._payload_spot_aliases.setdefault(
+                        self._normalize_match_text(alias), set()
+                    ).add(spot)
+                self._register_entity_terms(
+                    " ".join(
+                        str(payload.get(key) or "")
+                        for key in ("doc_title", "chunk_gen_title", "chunk_text")
+                    )[:1800],
+                    spot,
+                )
+            for field, value in payload.items():
+                if not isinstance(field, str) or not field.startswith("dim_"):
+                    continue
+                dim_name = field[4:]
+                if not dim_name:
+                    continue
+                tags = self._split_payload_tags(value)
+                for tag_name in tags:
+                    key = (dim_name, tag_name)
+                    self._payload_dim_tags.setdefault(dim_name, set()).add(tag_name)
+                    self._payload_tag_points.setdefault(key, set()).add(chunk_id)
+                    self._payload_tags_by_chunk.setdefault(chunk_id, []).append(
+                        {"dim": dim_name, "tag": tag_name}
+                    )
+
+        # 兼容旧版独立 dimension_tags collection。将其平铺到同一套索引后，
+        # 后续仍然执行“查询分析 -> 同维度匹配 -> 景区过滤”，不再走全局标签混排。
+        if not self._payload_tag_points and self._dim_tags_collection_available:
+            try:
+                tag_points = self.client.scroll(
+                    self.dim_tags_collection, limit=10000, with_payload=True
+                )
+                for point in tag_points:
+                    tag_payload = point.get("payload") or {}
+                    dim_name = str(tag_payload.get("dim_name") or "").strip()
+                    tag_name = str(tag_payload.get("tag_name") or "").strip()
+                    chunk_ids = tag_payload.get("chunk_ids") or []
+                    if not dim_name or not tag_name or not isinstance(chunk_ids, list):
+                        continue
+                    self._payload_dim_tags.setdefault(dim_name, set()).add(tag_name)
+                    self._payload_tag_points.setdefault((dim_name, tag_name), set()).update(
+                        str(cid) for cid in chunk_ids if cid
+                    )
+            except Exception as exc:
+                print(f"    [提示] 未能读取独立维度标签索引: {exc}")
+
+        if self._payload_dim_tags:
+            tag_count = sum(len(values) for values in self._payload_dim_tags.values())
+            chunk_count = len(self._payload_tags_by_chunk)
+            print(
+                f"    Qdrant payload 维度索引: {len(self._payload_dim_tags)} 个维度, "
+                f"{tag_count} 个标签, {chunk_count} 个带标签 chunk"
+            )
+        else:
+            print("    [提示] Qdrant 语料中没有非空 dim_* 字段")
+        if self._payload_spot_chunks:
+            print(f"    景区索引: {len(self._payload_spot_chunks)} 个景区")
+
+    @staticmethod
+    def _cosine(left: list, right: list) -> float:
+        if not left or not right:
+            return 0.0
+        size = min(len(left), len(right))
+        dot = sum(float(left[i]) * float(right[i]) for i in range(size))
+        norm_left = math.sqrt(sum(float(left[i]) ** 2 for i in range(size)))
+        norm_right = math.sqrt(sum(float(right[i]) ** 2 for i in range(size)))
+        return dot / (norm_left * norm_right + 1e-8)
+
+    def _encode_payload_tags(self):
+        """为 payload 标签建立一次性向量缓存；失败时仍可用字符串匹配。"""
+        if self._payload_tag_vectors_loaded:
+            return
+        self._payload_tag_vectors_loaded = True
+        if not self.encoder or not self._payload_tag_points:
+            return
+
+        labels = [f"{dim}: {tag}" for dim, tag in self._payload_tag_points]
+        try:
+            cls_name = self.encoder.__class__.__name__
+            if cls_name in ("_FlagProxy", "BGEM3FlagModel", "M3Embedder"):
+                encoded = self.encoder.encode(labels, return_dense=True)
+                vectors = encoded["dense_vecs"]
+            else:
+                vectors = self.encoder.encode(
+                    labels, normalize_embeddings=True, show_progress_bar=False
+                )
+            for key, vector in zip(self._payload_tag_points, vectors):
+                self._payload_tag_vectors[key] = (
+                    vector.tolist() if hasattr(vector, "tolist") else list(vector)
+                )
+            print(f"    payload 标签向量: {len(self._payload_tag_vectors)} 个")
+        except Exception as exc:
+            # 标签向量只是增强项，不能影响基于 payload 的精确匹配。
+            print(f"    [提示] payload 标签向量生成失败，将使用文本匹配: {exc}")
+
+    def _tag_match(self, query_text: str, dim_name: str, tag_name: str) -> tuple[float, str]:
+        """返回 (匹配分数, 来源)，来源为 exact、alias 或 vector。"""
+        query_norm = self._normalize_match_text(query_text)
+        tag_norm = self._normalize_match_text(tag_name)
+        if not query_norm or not tag_norm or len(tag_norm) < 2:
+            return 0.0, "none"
+        if tag_norm in query_norm:
+            return 1.0 + min(len(tag_norm) / max(len(query_norm), 1), 0.25), "exact"
+
+        # 维度标签别名只在同一维度内生效，避免“交通/服务”等短词跨维度串线。
+        aliases = {
+            "门票": {"票价", "票", "收费", "费用"},
+            "票价": {"门票", "票", "收费", "费用"},
+            "开放时间": {"开放", "营业时间", "开门时间"},
+            "地理位置": {"位置", "位于", "在哪里", "地处"},
+            "人物谱系": {"谁", "哪位", "人物"},
+            "涉及皇帝": {"谁", "哪位", "皇帝"},
+            "相关人物": {"谁", "哪位", "人物"},
+        }
+        for alias in aliases.get(str(tag_name).strip(), set()):
+            if self._normalize_match_text(alias) in query_norm:
+                return 0.96, "alias"
+        return 0.0, "none"
+
+    def _payload_tag_score(
+        self,
+        query_text: str,
+        dim_name: str,
+        tag_name: str,
+        query_vec: list,
+    ) -> tuple[float, str]:
+        """先做同维度精确/别名判断，失败后才计算标签向量相似度。"""
+        score, source = self._tag_match(query_text, dim_name, tag_name)
+        if source != "none":
+            return score, source
+
+        tag_vec = self._payload_tag_vectors.get((dim_name, tag_name))
+        if tag_vec:
+            return self._cosine(query_vec, tag_vec), "vector"
+
+        # 编码器不可用时只返回保守的向量兜底近似值；调用方仍会经过阈值和 margin。
+        q_chars = set(self._normalize_match_text(query_text))
+        t_chars = set(self._normalize_match_text(tag_name))
+        if len(t_chars) < 2:
+            return 0.0, "none"
+        return len(q_chars & t_chars) / math.sqrt(len(q_chars) * len(t_chars) + 1e-8), "vector"
+
+    def _analyze_query(self, query_text: str) -> dict:
+        """按固定顺序独立分析景区、实体和 1～3 个查询维度。"""
+        query = str(query_text or "").strip()
+        normalized = self._normalize_match_text(query)
+        spot_scores: Dict[str, float] = {}
+        entity_terms: list[str] = []
+
+        # 1) 显式景区与别名识别。
+        for canonical, aliases in self._SPOT_ALIASES.items():
+            for alias in aliases | {canonical}:
+                alias_norm = self._normalize_match_text(alias)
+                if alias_norm and alias_norm in normalized:
+                    spot_scores[canonical] = max(
+                        spot_scores.get(canonical, 0.0),
+                        1.0 + len(alias_norm) / 100.0,
+                    )
+        for alias_norm, spots in self._payload_spot_aliases.items():
+            if alias_norm and alias_norm in normalized:
+                for spot in spots:
+                    spot_scores[spot] = max(spot_scores.get(spot, 0.0), 1.0 + len(alias_norm) / 100.0)
+
+        # 2) 通过已观察到的实体词反推景区；只接受唯一且明显领先的景区。
+        query_runs = re.findall(r"[\u4e00-\u9fff]{2,}", query)
+        entity_candidates: Dict[str, Set[str]] = {}
+        for run in query_runs:
+            for size in (4, 3, 2):
+                for start in range(0, max(0, len(run) - size + 1)):
+                    term = run[start:start + size]
+                    if term in self._ENTITY_STOPWORDS or term in {"问题", "内容", "方面"}:
+                        continue
+                    spots = self._payload_spot_entity_index.get(term, set())
+                    if spots:
+                        entity_candidates[term] = set(spots)
+        counts: Dict[str, int] = {}
+        explicit_spots = set(spot_scores)
+        for term, spots in entity_candidates.items():
+            if len(spots) != 1:
+                continue
+            spot = next(iter(spots))
+            # 显式景区存在时，只保留属于该景区的实体；否则用于反推景区。
+            if explicit_spots and spot not in explicit_spots:
+                continue
+            entity_terms.append(term)
+            counts[spot] = counts.get(spot, 0) + min(len(term), 4)
+        if not spot_scores and counts:
+            ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+            if len(ordered) == 1 or ordered[0][1] >= ordered[1][1] * 1.5:
+                spot_scores[ordered[0][0]] = min(0.88, 0.45 + ordered[0][1] / 20.0)
+        entity_terms = sorted(set(entity_terms), key=len, reverse=True)[:8]
+
+        spot_names = [spot for spot, _ in sorted(spot_scores.items(), key=lambda item: item[1], reverse=True)]
+        spot_confidence = min(1.0, max(spot_scores.values(), default=0.0))
+
+        # 3) 先收集标签精确/别名值，再结合问题词确定最多三个相关维度。
+        dimension_values: Dict[str, list[str]] = {}
+        dimension_sources: Dict[str, list[str]] = {}
+        exact_dim_scores: Dict[str, int] = {}
+        for dim_name, tags in self._payload_dim_tags.items():
+            for tag_name in tags:
+                score, source = self._tag_match(query, dim_name, tag_name)
+                if source == "none":
+                    continue
+                dimension_values.setdefault(dim_name, []).append(tag_name)
+                dimension_sources.setdefault(dim_name, []).append(source)
+                exact_dim_scores[dim_name] = exact_dim_scores.get(dim_name, 0) + 1
+
+        dim_scores: Dict[str, int] = {}
+        for dim_name in self._payload_dim_tags:
+            cue_score = self._dimension_cue_score(dim_name, query)
+            # 标签显式命中权重高于问题措辞线索。
+            dim_scores[dim_name] = cue_score + 3 * exact_dim_scores.get(dim_name, 0)
+
+        ranked_dims = sorted(dim_scores, key=lambda dim: (dim_scores[dim], exact_dim_scores.get(dim, 0)), reverse=True)
+        active_dimensions = [
+            dim for dim in ranked_dims
+            if dim_scores.get(dim, 0) > 0 and dim not in SearchConfig.EXCLUDED_DIMS
+        ][:SearchConfig.DIM_MAX_ACTIVE_DIMS]
+        # 没有维度线索时，严格返回空集合，由语义检索负责，而不是全库标签向量召回。
+        active_set = set(active_dimensions)
+        dimension_values = {dim: sorted(set(values)) for dim, values in dimension_values.items() if dim in active_set}
+        dimension_sources = {dim: sorted(set(values)) for dim, values in dimension_sources.items() if dim in active_set}
+        cue_total = sum(1 for dim in active_dimensions if self._dimension_cue_score(dim, query) > 0)
+        exact_total = sum(exact_dim_scores.get(dim, 0) for dim in active_dimensions)
+        confidence = min(1.0, 0.45 * spot_confidence + 0.15 * min(cue_total, 3) + 0.15 * min(exact_total, 3))
+        if active_dimensions and confidence == 0.0:
+            confidence = 0.25
+
+        return {
+            "spot_names": spot_names[:3],
+            "spot_confidence": round(spot_confidence, 4),
+            "entity_terms": entity_terms,
+            "active_dimensions": active_dimensions,
+            "dimension_values": dimension_values,
+            "dimension_sources": dimension_sources,
+            "confidence": round(confidence, 4),
+            "required_slots": [],
+        }
+
+    def _entity_score(self, item: dict, query_analysis: dict) -> float:
+        """计算候选是否包含查询识别出的景点/实体，范围固定在 [0, 1]。"""
+        terms = query_analysis.get("entity_terms") or []
+        if not terms:
+            return 1.0 if query_analysis.get("spot_names") and item.get("spot_name") in set(query_analysis.get("spot_names")) else 0.0
+        text = self._normalize_match_text(
+            " ".join(
+                str(item.get(key) or "")
+                for key in ("chunk_gen_title", "doc_title", "chunk_text_full", "chunk_text")
+            )
+        )
+        matched = [term for term in terms if self._normalize_match_text(term) in text]
+        return min(1.0, max((len(term) for term in matched), default=0) / max(len(terms[0]), 1))
+
+    @staticmethod
+    def _dimension_coverage(item: dict, query_analysis: dict) -> float:
+        active = set(query_analysis.get("active_dimensions") or [])
+        if not active:
+            return 0.0
+        matched = set(item.get("matched_dimensions") or [])
+        if not matched:
+            matched = {
+                hit.get("dim")
+                for hit in item.get("tag_hits", [])
+                if hit.get("dim")
+            }
+        return len(active & matched) / len(active)
+
+    def _dim_recall_by_payload(
+        self,
+        query_vec: list,
+        query_text: str,
+        top_k: int,
+        query_analysis: Optional[dict] = None,
+    ) -> tuple[list, list]:
+        """景区硬过滤后，在激活维度内精确/别名优先、向量兜底。"""
+        if not self._payload_tag_points:
+            return [], []
+        self._encode_payload_tags()
+        analysis = query_analysis or self._analyze_query(query_text)
+        active_dimensions = [
+            dim for dim in analysis.get("active_dimensions", [])
+            if dim in self._payload_dim_tags and dim not in SearchConfig.EXCLUDED_DIMS
+        ]
+        if not active_dimensions:
+            return [], []
+
+        selected: list[tuple[float, str, str, str]] = []
+        allowed_spots = set(analysis.get("spot_names") or [])
+        for dim_name in active_dimensions:
+            exact_hits = []
+            vector_hits = []
+            for tag_name in self._payload_dim_tags.get(dim_name, set()):
+                score, source = self._payload_tag_score(query_text, dim_name, tag_name, query_vec)
+                tag_chunk_ids = self._payload_tag_points.get((dim_name, tag_name), set())
+                if allowed_spots:
+                    if not any(
+                        self._payload_spot_by_chunk.get(str(cid), "") in allowed_spots
+                        for cid in tag_chunk_ids
+                    ):
+                        continue
+                if source in {"exact", "alias"}:
+                    exact_hits.append((score, dim_name, tag_name, source))
+                elif source == "vector":
+                    vector_hits.append((score, dim_name, tag_name, source))
+
+            # 一个维度已经有明确值时，不让相邻语义标签污染该维度。
+            if exact_hits:
+                selected.extend(sorted(exact_hits, reverse=True)[:SearchConfig.DIM_TAG_TOP_K_PER_DIM])
+                continue
+
+            vector_hits.sort(reverse=True)
+            if not vector_hits:
+                continue
+            best = vector_hits[0][0]
+            second = vector_hits[1][0] if len(vector_hits) > 1 else 0.0
+            if best < SearchConfig.DIM_TAG_SIM_THRESHOLD:
+                continue
+            if len(vector_hits) > 1 and best - second < SearchConfig.DIM_TAG_MARGIN:
+                continue
+            selected.extend(
+                hit for hit in vector_hits[:SearchConfig.DIM_TAG_TOP_K_PER_DIM]
+                if hit[0] >= SearchConfig.DIM_TAG_SIM_THRESHOLD
+            )
+
+        if not selected:
+            return [], []
+
+        all_candidates: Dict[str, dict] = {}
+        tag_hits = []
+        for tag_score, dim_name, tag_name, match_source in selected:
+            chunk_ids = self._payload_tag_points.get((dim_name, tag_name), set())
+            if allowed_spots:
+                chunk_ids = {
+                    cid for cid in chunk_ids
+                    if self._payload_spot_by_chunk.get(str(cid), "") in allowed_spots
+                }
+            if not chunk_ids:
+                continue
+            hit = {
+                "id": f"payload:{dim_name}:{tag_name}",
+                "score": tag_score,
+                "payload": {
+                    "dim_name": dim_name,
+                    "tag_name": tag_name,
+                    "chunk_ids": sorted(chunk_ids),
+                    "match_source": match_source,
+                    "raw_score": tag_score,
+                },
+            }
+            tag_hits.append(hit)
+            self._merge_candidate(hit, all_candidates)
+
+        if not all_candidates:
+            return [], tag_hits
+        payloads = self.client.retrieve(self.collection_name, list(all_candidates.keys()))
+        return self._build_candidates(payloads, all_candidates, "payload"), tag_hits
+
     # ---------- 检索主入口 ----------
     def search(
         self,
@@ -420,7 +966,23 @@ class DimensionAwareSearch:
         if alpha is None:
             alpha = SearchConfig.DEFAULT_ALPHA
 
-        results = {"results": [], "constraints": {}, "query_text": query_text}
+        query_analysis = kwargs.get("query_analysis") or self._analyze_query(query_text)
+        independent_constraints = {
+            dim: values
+            for dim, values in (query_analysis.get("dimension_values") or {}).items()
+            if values
+        }
+        independent_constraints.update({
+            "_active_dimensions": query_analysis.get("active_dimensions", []),
+            "_spot_names": query_analysis.get("spot_names", []),
+            "_query_confidence": query_analysis.get("confidence", 0.0),
+        })
+        results = {
+            "results": [],
+            "constraints": independent_constraints,
+            "query_analysis": query_analysis,
+            "query_text": query_text,
+        }
 
         query_vec = _encode_query(self.encoder, query_text)
         if query_vec is None:
@@ -430,7 +992,7 @@ class DimensionAwareSearch:
         sem_results = []
         if fusion != "dim_only":
             try:
-                sem_results = self._sem_search_via_qdrant(query_vec, top_k)
+                sem_results = self._sem_search_via_qdrant(query_vec, top_k, query_analysis)
                 results["constraints"]["_sem_count"] = len(sem_results)
             except Exception as e:
                 print(f"[警告] 语义检索失败: {e}")
@@ -441,18 +1003,9 @@ class DimensionAwareSearch:
         if fusion != "sem_only":
             try:
                 dim_results = self._dim_search_via_qdrant(
-                    query_vec, query_text, top_k, recall_method=recall_method
+                    query_vec, query_text, top_k, recall_method=recall_method,
+                    query_analysis=query_analysis,
                 )
-                # 从 dim 收集中提炼 constraints
-                constraints: Dict[str, set] = {}
-                for r in dim_results:
-                    dm = r.get("dim_name") or ""
-                    tn = r.get("tag_name") or ""
-                    if dm:
-                        constraints.setdefault(dm, set()).add(tn)
-                for k in constraints:
-                    constraints[k] = sorted([x for x in constraints[k] if x])[:8]
-                results["constraints"].update(constraints)
                 results["recall_method"] = recall_method
             except Exception as e:
                 print(f"[警告] 维度检索失败: {e}")
@@ -462,18 +1015,32 @@ class DimensionAwareSearch:
         return results
 
     # ---------- 语义子检索（rag_chunks / chunk_text_vec） ----------
-    def _sem_search_via_qdrant(self, query_vec: list, top_k: int) -> list:
+    def _sem_search_via_qdrant(
+        self,
+        query_vec: list,
+        top_k: int,
+        query_analysis: Optional[dict] = None,
+    ) -> list:
+        analysis = query_analysis or {}
+        allowed_spots = set(analysis.get("spot_names") or [])
+        hard_filter = bool(allowed_spots and self._payload_spot_by_chunk)
+        search_k = top_k * SearchConfig.SPOT_FILTER_POOL_MULTIPLIER if hard_filter else top_k
         hits = self.client.search(
             collection=self.collection_name,
             query_vector=query_vec,
             vector_name="chunk_text_vec",
-            top_k=top_k,
+            top_k=search_k,
         )
         out = []
         for i, hit in enumerate(hits):
             payload = hit.get("payload") or {}
             cid = payload.get("chunk_id") or hit.get("id")
-            out.append({
+            spot_name = self._payload_spot_by_chunk.get(str(cid), "") or self._canonical_spot(
+                self._spot_from_payload(payload)
+            )
+            if hard_filter and spot_name not in allowed_spots:
+                continue
+            item = {
                 "chunk_id": cid,
                 "chunk_text": payload.get("chunk_text", ""),
                 "doc_title": payload.get("doc_title", ""),
@@ -482,7 +1049,12 @@ class DimensionAwareSearch:
                 "score": hit.get("score", 0.0),
                 "sem_rank": i + 1,
                 "source": "sem",
-            })
+                "spot_name": spot_name,
+                "entity_score": self._entity_score(payload, analysis),
+            }
+            out.append(item)
+            if len(out) >= top_k:
+                break
         return out
 
     # ---------- 维度检索主方法（两阶段：召回 + 精排） ----------
@@ -492,6 +1064,7 @@ class DimensionAwareSearch:
         query_text: str,
         top_k: int,
         recall_method: str = None,
+        query_analysis: Optional[dict] = None,
     ) -> list:
         """
         维度检索两阶段：
@@ -506,13 +1079,21 @@ class DimensionAwareSearch:
 
         # ---- 第一阶段：粗召回（全部候选）----
         if recall_method == "vec":
-            raw_candidates, recalled_tag_hits = self._dim_recall_by_vec(query_vec, query_text, top_k)
+            raw_candidates, recalled_tag_hits = self._dim_recall_by_vec(
+                query_vec, query_text, top_k, query_analysis
+            )
         elif recall_method == "constraint":
-            raw_candidates, recalled_tag_hits = self._dim_recall_by_constraint(query_text, top_k)
+            raw_candidates, recalled_tag_hits = self._dim_recall_by_constraint(
+                query_text, top_k, query_analysis
+            )
         elif recall_method == "tag":
-            raw_candidates, recalled_tag_hits = self._dim_recall_by_tag(query_vec, query_text, top_k)
+            raw_candidates, recalled_tag_hits = self._dim_recall_by_tag(
+                query_vec, query_text, top_k, query_analysis
+            )
         else:
-            raw_candidates, recalled_tag_hits = self._dim_recall_by_tag(query_vec, query_text, top_k)
+            raw_candidates, recalled_tag_hits = self._dim_recall_by_tag(
+                query_vec, query_text, top_k, query_analysis
+            )
 
         if not raw_candidates:
             return []
@@ -529,25 +1110,42 @@ class DimensionAwareSearch:
             recalled_tag_hits=recalled_tag_hits,
             top_k=top_k,
         )
+        for item in reranked:
+            item.setdefault("entity_score", self._entity_score(item, query_analysis or {}))
+            item.setdefault("dimension_coverage", self._dimension_coverage(item, query_analysis or {}))
         return reranked
 
     # ---------- 方法一：query 向量 - D 向量 ----------
-    def _dim_recall_by_vec(self, query_vec: list, query_text: str, top_k: int) -> tuple[list, list]:
+    def _dim_recall_by_vec(
+        self,
+        query_vec: list,
+        query_text: str,
+        top_k: int,
+        query_analysis: Optional[dict] = None,
+    ) -> tuple[list, list]:
         """
         方法一：query 向量 - D 向量。
         D_cand = TopK_D( sim(v_q, v_D) )
         返回 (候选列表, 空 tag_hits列表)
         """
+        analysis = query_analysis or self._analyze_query(query_text)
+        allowed_spots = set(analysis.get("spot_names") or [])
+        hard_filter = bool(allowed_spots and self._payload_spot_by_chunk)
         hits = self.client.search(
             collection=self.collection_name,
             query_vector=query_vec,
             vector_name="chunk_text_vec",
-            top_k=top_k,
+            top_k=top_k * SearchConfig.SPOT_FILTER_POOL_MULTIPLIER if hard_filter else top_k,
         )
         candidates = []
         for i, hit in enumerate(hits):
             payload = hit.get("payload") or {}
             cid = payload.get("chunk_id") or hit.get("id")
+            spot_name = self._payload_spot_by_chunk.get(str(cid), "") or self._canonical_spot(
+                self._spot_from_payload(payload)
+            )
+            if hard_filter and spot_name not in allowed_spots:
+                continue
             candidates.append({
                 "chunk_id": cid,
                 "chunk_text": payload.get("chunk_text", ""),
@@ -561,18 +1159,29 @@ class DimensionAwareSearch:
                 "tag_name": "",
                 "dim_name": "",
                 "tag_hits": [],
+                "matched_dimensions": [],
+                "match_sources": [],
+                "match_source": "vector",
+                "spot_name": spot_name,
+                "entity_score": self._entity_score(payload, analysis),
                 "evidence": [f"vec_score={hit.get('score', 0):.4f}"],
             })
         return candidates, []
 
     # ---------- 方法二：query 维度 - D 维度 ----------
-    def _dim_recall_by_constraint(self, query_text: str, top_k: int) -> tuple[list, list]:
+    def _dim_recall_by_constraint(
+        self,
+        query_text: str,
+        top_k: int,
+        query_analysis: Optional[dict] = None,
+    ) -> tuple[list, list]:
         """
         方法二：query 维度 - D 维度。
         解析 query 维度约束，筛选文档。
         返回 (候选列表, 空 tag_hits列表)
         """
-        constraints = self._parse_query_constraints(query_text)
+        analysis = query_analysis or self._analyze_query(query_text)
+        constraints = analysis.get("dimension_values") or {}
         if not constraints:
             print("[提示] 维度约束解析失败，constraint 方法无结果")
             return [], []
@@ -591,6 +1200,13 @@ class DimensionAwareSearch:
                     self._merge_candidate(hit, all_candidates)
                     tag_hits_out.append(hit)
 
+        allowed_spots = set(analysis.get("spot_names") or [])
+        if allowed_spots and self._payload_spot_by_chunk:
+            all_candidates = {
+                key: value for key, value in all_candidates.items()
+                if self._payload_spot_by_chunk.get(key, "") in allowed_spots
+            }
+
         if not all_candidates:
             return [], []
 
@@ -599,20 +1215,46 @@ class DimensionAwareSearch:
         return candidates, tag_hits_out
 
     # ---------- 方法三：query 向量 - 维度标签向量 ----------
-    def _dim_recall_by_tag(self, query_vec: list, query_text: str, top_k: int) -> tuple[list, list]:
+    def _dim_recall_by_tag(
+        self,
+        query_vec: list,
+        query_text: str,
+        top_k: int,
+        query_analysis: Optional[dict] = None,
+    ) -> tuple[list, list]:
         """
         方法三：query 向量 - 维度标签向量。
         L_q = TopK_{(m,t)}( sim(v_q, v_{m,t}) )
         D_cand = {D | T_D ∩ L_q != empty}
         返回 (候选列表, 原始 tag_hits)
         """
-        tag_hits = self.client.search(
-            collection=self.dim_tags_collection,
-            query_vector=query_vec,
-            vector_name="chunk_text_vec",
-            top_k=top_k * 2,
-        )
+        analysis = query_analysis or self._analyze_query(query_text)
+        # 新 payload 通路包含景区、维度和值三类信息，优先使用它实现严格的
+        # 景区硬过滤和同维度阈值/margin；否则旧 collection 的全局标签召回会
+        # 把不同景区的同名标签混在一起。
+        if self._payload_tag_points:
+            payload_candidates, payload_tag_hits = self._dim_recall_by_payload(
+                query_vec, query_text, top_k, analysis
+            )
+            if payload_candidates or analysis.get("active_dimensions"):
+                return payload_candidates, payload_tag_hits
+
+        tag_hits = []
+        if self._dim_tags_collection_available:
+            tag_hits = self.client.search(
+                collection=self.dim_tags_collection,
+                query_vector=query_vec,
+                vector_name="chunk_text_vec",
+                top_k=top_k * 2,
+            )
         if not tag_hits:
+            # 新版入库将标签写在 unified_corpus 的 dim_* payload 中。
+            # 当旧的 dimension_tags collection 不存在或为空时，直接走该通路。
+            payload_candidates, payload_tag_hits = self._dim_recall_by_payload(
+                query_vec, query_text, top_k, analysis
+            )
+            if payload_candidates:
+                return payload_candidates, payload_tag_hits
             return [], []
 
         all_candidates: Dict[str, dict] = {}
@@ -643,11 +1285,28 @@ class DimensionAwareSearch:
             "with_payload": True,
             "with_vector": False,
         }
-        try:
-            data = self._post_json(f"/collections/{self.dim_tags_collection}/points/scroll", body)
-            return data.get("result", {}).get("points", [])
-        except Exception:
+        if self._dim_tags_collection_available:
+            try:
+                data = self._post_json(f"/collections/{self.dim_tags_collection}/points/scroll", body)
+                points = data.get("result", {}).get("points", [])
+                if points:
+                    return points
+            except Exception:
+                pass
+
+        # dimension_tags 不存在时，从 Qdrant 语料 point 的动态维度列恢复命中。
+        chunk_ids = sorted(self._payload_tag_points.get((dim_name, tag_name), set()))
+        if not chunk_ids:
             return []
+        return [{
+            "id": f"payload:{dim_name}:{tag_name}",
+            "score": 1.0,
+            "payload": {
+                "dim_name": dim_name,
+                "tag_name": tag_name,
+                "chunk_ids": chunk_ids,
+            },
+        }]
 
     def _merge_candidate(self, hit: dict, candidates: dict):
         """将一个 tag_hit 合并到候选集合中。"""
@@ -668,12 +1327,20 @@ class DimensionAwareSearch:
                     "tag_name": payload.get("tag_name", ""),
                     "dim_name": payload.get("dim_name", ""),
                     "tag_hits": [],
+                    "matched_dimensions": set(),
+                    "match_sources": set(),
                 }
             candidates[cid_norm]["tag_hits"].append({
                 "tag": payload.get("tag_name", ""),
                 "dim": payload.get("dim_name", ""),
                 "score": tag_score,
+                "raw_score": payload.get("raw_score", tag_score),
+                "match_source": payload.get("match_source", "vector"),
             })
+            if payload.get("dim_name"):
+                candidates[cid_norm]["matched_dimensions"].add(payload.get("dim_name"))
+            if payload.get("match_source"):
+                candidates[cid_norm]["match_sources"].add(payload.get("match_source"))
             if tag_score > candidates[cid_norm]["dim_score"]:
                 candidates[cid_norm]["dim_score"] = tag_score
 
@@ -710,6 +1377,14 @@ class DimensionAwareSearch:
                 "tag_name": meta.get("tag_name", ""),
                 "dim_name": meta.get("dim_name", ""),
                 "tag_hits": meta.get("tag_hits", []),
+                "matched_dimensions": sorted(meta.get("matched_dimensions", set())),
+                "match_sources": sorted(meta.get("match_sources", set())),
+                "match_source": (
+                    "exact" if "exact" in meta.get("match_sources", set()) else
+                    "alias" if "alias" in meta.get("match_sources", set()) else
+                    "vector" if "vector" in meta.get("match_sources", set()) else ""
+                ),
+                "spot_name": self._payload_spot_by_chunk.get(str(cid), ""),
                 "evidence": [
                     f"{h['dim']}:{h['tag']}"
                     for h in meta.get("tag_hits", [])
@@ -799,6 +1474,16 @@ class DimensionAwareSearch:
                 dm = th.get("dim", "")
                 tn = th.get("tag", "")
                 score = th.get("score", 0.0)
+
+                # 精确/别名命中是离散证据，不能被标签向量均值稀释。
+                if th.get("match_source") == "exact":
+                    tag_sim_sum += 1.0
+                    tag_count += 1
+                    continue
+                if th.get("match_source") == "alias":
+                    tag_sim_sum += 0.96
+                    tag_count += 1
+                    continue
 
                 if self.tag_vectors:
                     key = (dm, tn)
@@ -1132,9 +1817,9 @@ class DimensionAwareSearch:
         if not hasattr(self, "_cached_tags") or self._cached_tags is None:
             try:
                 body = {"limit": 10000, "with_payload": True, "with_vector": False}
-                data = self._post_json(
-                    f"/collections/{self.dim_tags_collection}/points/scroll", body
-                )
+                if not self._dim_tags_collection_available:
+                    raise RuntimeError("dimension_tags collection unavailable")
+                data = self._post_json(f"/collections/{self.dim_tags_collection}/points/scroll", body)
                 points = data.get("result", {}).get("points", [])
                 tag_index: Dict[str, set] = {}
                 for pt in points:
@@ -1146,7 +1831,10 @@ class DimensionAwareSearch:
                 self._cached_tags = tag_index
             except Exception:
                 self._cached_tags = {}
-                return {}
+
+            # 新版 Qdrant 直接保存 dim_* payload，独立标签 collection 可能不存在。
+            for dim_name, tags in self._payload_dim_tags.items():
+                self._cached_tags.setdefault(dim_name, set()).update(tags)
 
         q_lower = query_text.lower()
         constraints: Dict[str, set] = {}

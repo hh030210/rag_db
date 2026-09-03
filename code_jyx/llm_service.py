@@ -21,6 +21,8 @@ OpenAI 兼容模式：
 import os
 import re
 import json
+import threading
+import time
 from typing import List, Dict, Optional, Any
 
 
@@ -124,6 +126,27 @@ PROMPT_EXTRACT_SINGLE = """你是一个领域知识抽取专家。
 请直接输出该维度的值（中文），如果未提及则输出 "NULL"：
 """
 
+PROMPT_EXTRACT_VALUES = """你是一个领域知识结构化评估专家。
+
+请判断下面的文本是否包含“{dim_name}”维度，并提取该维度在文本中明确出现的全部值。
+
+严格要求：
+1. 只能依据当前文本，不得使用文本外的信息。
+2. 一个文本可能有多个值，必须全部列出。
+3. 如果没有明确值，返回空数组。
+4. 值应尽量使用文本中的原词，不要改写、概括或推断。
+5. 只输出 JSON，不要输出解释或 Markdown。
+
+输出格式：
+{{"values": ["值1", "值2"]}}
+
+维度名称：{dim_name}
+文本：
+---
+{text}
+---
+"""
+
 PROMPT_EXTRACT_BATCH = """你是一个领域知识抽取专家。
 
 给定多个维度的名称，请从以下文档文本中同时抽取每个维度的值。
@@ -139,6 +162,48 @@ PROMPT_EXTRACT_BATCH = """你是一个领域知识抽取专家。
 请以 JSON 格式输出，key 为维度名称，value 为该维度的值列表（数组）：
 {{"维度名1": ["值1", "值2"], "维度名2": ["值3"]}}
 如果某个维度在文档中未提及，请不要包含在输出中。
+"""
+
+PROMPT_EXTRACT_MULTI_BATCH = """你是一个领域知识抽取专家。
+
+请分别阅读下面的多条文本，并为每条文本抽取指定维度的值。
+只输出文本中有明确依据的维度；没有提及的维度使用空对象。
+
+指定维度：{dims_list}
+
+输出要求：
+1. 只输出 JSON 对象，不要输出解释、Markdown 或思考过程。
+2. 顶层 key 必须使用输入记录中的原始 ID。
+3. 每个 ID 对应一个对象，对象的 key 必须是指定维度名称，value 必须是字符串数组。
+4. 不要臆测文本中没有出现的信息。
+
+输出格式示例：
+{{"记录ID-1": {{"地理位置": ["衢州"], "建筑功能": ["祭祀孔子"]}}, "记录ID-2": {{}}}}
+
+待处理记录：
+{records_block}
+"""
+
+PROMPT_VALIDATE_SCHEMA_BATCH = """你是一个知识库 schema 验证专家。
+
+当前任务不是给数据库写标签，而是验证“候选维度名称是否适合成为统一的知识库 schema”。
+请分别阅读下面的多条 chunk，只判断指定候选维度在每条文本中是否存在明确证据，并列出
+文本中原样出现的值，用于统计该维度的覆盖率和区分度。
+
+严格要求：
+1. 只能依据当前 chunk 文本，不得跨 chunk 推断或补全。
+2. 只允许使用指定候选维度，不要创造新维度。
+3. 没有明确值的维度不要输出。
+4. 一个 chunk 的同一维度可以有多个值，全部放入数组。
+5. 只输出 JSON，不要解释、Markdown 或思考过程。
+
+候选维度：{dims_list}
+
+输出格式：
+{{"records": [{{"id": "原始ID", "dimensions": {{"维度名": ["值1", "值2"]}}}}]}}
+
+待验证 chunk：
+{records_block}
 """
 
 PROMPT_KEYWORDS_FALLBACK = """你是一个关键词提取专家。
@@ -234,6 +299,16 @@ PROMPT_SCHEMA_CONSTRAINT = """
 """
 
 
+def _clip_text(text: str, max_chars: int) -> str:
+    """限制提示词长度，同时保留文本首尾，避免只看前缀漏掉后半段维度。"""
+    text = str(text or "")
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    return f"{text[:head]}\n...[中间内容省略，仅用于控制长度]...\n{text[-tail:]}"
+
+
 # ============================================================
 # 核心类
 # ============================================================
@@ -276,6 +351,26 @@ class DimensionMiningWithQwen:
                 "或在构造函数中传入 api_key。"
             )
 
+        # 通过环境变量控制请求间隔，避免批量维度抽取触发服务限流。
+        # 默认 0 保持原有调用速度；服务器实验显式设置为 2 秒。
+        try:
+            self.api_interval = max(0.0, float(os.getenv("LLM_API_INTERVAL", "0")))
+        except ValueError:
+            self.api_interval = 0.0
+        self._rate_lock = threading.Lock()
+        self._last_request_at = 0.0
+
+    def _wait_for_rate_limit(self):
+        """在发起下一次 LLM 请求前等待指定间隔。"""
+        if self.api_interval <= 0:
+            return
+        with self._rate_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            wait = self.api_interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.monotonic()
+
     # ----------------------------------------------------------
     # 内部调用方法
     # ----------------------------------------------------------
@@ -292,6 +387,7 @@ class DimensionMiningWithQwen:
         Returns:
             LLM 输出的文本内容。
         """
+        self._wait_for_rate_limit()
         if self.openai_compat:
             return self._call_llm_openai(prompt, temperature=temperature, timeout=timeout)
 
@@ -317,13 +413,20 @@ class DimensionMiningWithQwen:
     def _call_llm_openai(self, prompt: str, temperature: float = 0.7, timeout: int = 60) -> str:
         """OpenAI 兼容协议调用"""
         client = _get_openai_client(self.base_url, self.api_key)
-        resp = client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            top_p=0.9,
-            timeout=timeout,
-        )
+        request_kwargs = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "top_p": 0.9,
+            "timeout": timeout,
+        }
+        # Qwen3 默认可能输出较长的思考过程。维度标签只需要结构化短答案，
+        # 关闭思考并设置较小的输出上限可显著降低批量标签生成的延迟。
+        if self.model_name.lower().startswith("qwen3"):
+            request_kwargs["max_tokens"] = 512
+            request_kwargs["extra_body"] = {"enable_thinking": False}
+
+        resp = client.chat.completions.create(**request_kwargs)
         if not resp.choices:
             raise RuntimeError(f"OpenAI 兼容 LLM 返回空 choices: {resp}")
         return (resp.choices[0].message.content or "").strip()
@@ -349,10 +452,16 @@ class DimensionMiningWithQwen:
         try:
             return json.loads(json_str)
         except json.JSONDecodeError:
-            # 尝试用正则提取花括号包围的 JSON
-            match2 = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", json_str)
-            if match2:
-                return json.loads(match2.group(0))
+            # Qwen 偶尔会连续输出两个 JSON 对象或在 JSON 后附加说明。
+            # 用 raw_decode 找到第一个完整对象，避免贪婪正则把两段拼在一起。
+            decoder = json.JSONDecoder()
+            for match2 in re.finditer(r"[\{\[]", json_str):
+                try:
+                    value, _ = decoder.raw_decode(json_str[match2.start():])
+                    if isinstance(value, (dict, list)):
+                        return value
+                except json.JSONDecodeError:
+                    continue
             raise ValueError(f"LLM 输出无法解析为 JSON:\n{text}")
 
     # ============================================================
@@ -372,10 +481,31 @@ class DimensionMiningWithQwen:
         if not docs:
             raise ValueError("文档列表为空")
 
-        # 限制输入长度：最多前 5 篇文档，每篇最多 300 字（减少 token 量加快响应）
+        # 使用分布更均匀的样本，而不是只取列表开头的文档；长度和数量可由
+        # 环境变量控制。维度发现阶段若只看 5*300 字，极易漏掉长文本后半段
+        # 和少数景区中的有效信息轴。
+        try:
+            max_docs = max(5, int(os.getenv("DIM_CANDIDATE_DOCS", "20")))
+        except ValueError:
+            max_docs = 20
+        try:
+            max_chars = max(300, int(os.getenv("DIM_CANDIDATE_DOC_CHARS", "800")))
+        except ValueError:
+            max_chars = 800
+
+        sample_count = min(max_docs, len(docs))
+        if sample_count == 1:
+            sample_indices = [0]
+        else:
+            sample_indices = [
+                round(i * (len(docs) - 1) / (sample_count - 1))
+                for i in range(sample_count)
+            ]
+
         snippet_docs = []
-        for doc in docs[:5]:
-            snippet_docs.append(doc[:300] if len(doc) > 300 else doc)
+        for index in sample_indices:
+            doc = str(docs[index] or "")
+            snippet_docs.append(_clip_text(doc, max_chars))
 
         docs_snippet = "\n\n---\n\n".join(snippet_docs)
 
@@ -386,13 +516,68 @@ class DimensionMiningWithQwen:
 
         raw = self._call_llm(prompt, temperature=0.7, timeout=120)
 
-        # 解析逗号分隔的维度列表
-        dims = [d.strip() for d in raw.split("，") if d.strip()]
-        # 也支持英文逗号
-        if len(dims) <= 1:
-            dims = [d.strip() for d in raw.split(",") if d.strip()]
+        # 解析常见的中英文逗号、顿号、分号和换行格式，并去除列表编号。
+        dims = []
+        for item in re.split(r"[，,、；;\n]+", raw):
+            item = re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", item).strip()
+            item = item.strip("\"'[]()（）")
+            if item and item not in dims:
+                dims.append(item)
 
-        return dims
+        try:
+            max_candidates = max(1, int(os.getenv("MAX_DIM_CANDIDATES", "30")))
+        except ValueError:
+            max_candidates = 30
+        return dims[:max_candidates]
+
+    def extract_dimension_values(
+        self,
+        text: str,
+        dim_name: str,
+        max_chars: int = None,
+    ) -> List[str]:
+        """抽取当前文本中某一维度的全部明确值。
+
+        该接口供维度发现阶段评估候选维度使用。与旧的单值接口相比，
+        它不会因一个 chunk 中存在多个值而低估覆盖率和辨识度。
+        """
+        if not text or not dim_name:
+            return []
+
+        if max_chars is None:
+            try:
+                max_chars = max(0, int(os.getenv("DIM_VALIDATION_CHARS", "4000")))
+            except ValueError:
+                max_chars = 4000
+        text = str(text)
+        text = _clip_text(text, max_chars)
+
+        prompt = PROMPT_EXTRACT_VALUES.format(dim_name=dim_name, text=text)
+        try:
+            result = self._call_llm_json(prompt, temperature=0.1)
+        except Exception:
+            return []
+
+        if isinstance(result, dict):
+            values = result.get("values", [])
+        elif isinstance(result, list):
+            values = result
+        else:
+            values = []
+
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            return []
+
+        cleaned = []
+        for value in values:
+            value = str(value or "").strip()
+            if not value or value.upper() in {"NULL", "NONE", "无", "未提及"}:
+                continue
+            if value not in cleaned:
+                cleaned.append(value)
+        return cleaned
 
     # ============================================================
     # Phase 3: 单维度单值抽取（迭代验证用）
@@ -409,25 +594,8 @@ class DimensionMiningWithQwen:
         Returns:
             抽取到的值字符串，或 None（表示未命中）。
         """
-        if not text or not dim_name:
-            return None
-
-        # 限制文本长度
-        truncated = text[:1500] if len(text) > 1500 else text
-
-        prompt = PROMPT_EXTRACT_SINGLE.format(
-            dim_name=dim_name,
-            text=truncated
-        )
-
-        try:
-            raw = self._call_llm(prompt, temperature=0.1)
-            raw = raw.strip()
-            if raw.upper() in ("NULL", "NONE", "无", "未提及", "未找到"):
-                return None
-            return raw
-        except Exception:
-            return None
+        values = self.extract_dimension_values(text, dim_name)
+        return values[0] if values else None
 
     # ============================================================
     # Phase 3: 维度优化决策
@@ -621,6 +789,134 @@ class DimensionMiningWithQwen:
         except (json.JSONDecodeError, ValueError) as e:
             print(f"[Warning] 批量抽取 JSON 解析失败，回退到单维度抽取: {e}")
             return self._extract_batch_fallback(text, dims_subset)
+
+    def extract_multi_chunk_dimensions(
+        self,
+        records: List[Dict[str, str]],
+        dims: List[str],
+        max_text_chars: int = 1000,
+    ) -> Dict[str, Dict[str, List[str]]]:
+        """一次请求处理多条 chunk，返回 ``doc_id -> 维度标签``。
+
+        标签抽取是批量实验的主要耗时环节。将多条 chunk 放入同一个
+        JSON 请求可以减少请求次数，同时仍保留每条 chunk 的 ID 关联。
+        """
+        if not records or not dims:
+            return {}
+
+        records_block = []
+        for record in records:
+            doc_id = str(record.get("doc_id", ""))
+            text = _clip_text(str(record.get("doc_text", "")), max_text_chars)
+            records_block.append(f"ID: {doc_id}\n文本：\n---\n{text}\n---")
+
+        prompt = PROMPT_EXTRACT_MULTI_BATCH.format(
+            dims_list="、".join(dims[:15]),
+            records_block="\n\n".join(records_block),
+        )
+
+        try:
+            result = self._call_llm_json(prompt, temperature=0.1)
+        except (json.JSONDecodeError, ValueError, RuntimeError) as e:
+            print(f"[Warning] 多 chunk 批量抽取失败: {e}")
+            return {}
+
+        if not isinstance(result, dict):
+            return {}
+
+        valid_ids = {str(record.get("doc_id", "")) for record in records}
+        cleaned: Dict[str, Dict[str, List[str]]] = {}
+        for raw_doc_id, tag_map in result.items():
+            raw_doc_id = str(raw_doc_id)
+            doc_id = raw_doc_id
+            if doc_id not in valid_ids:
+                # 模型有时会把示例中的“记录ID-”前缀带入 key；按最长
+                # 后缀匹配恢复原始 ID，避免 chunk 标签无法回填。
+                matches = [candidate for candidate in valid_ids if raw_doc_id.endswith(candidate)]
+                if matches:
+                    doc_id = max(matches, key=len)
+            if doc_id not in valid_ids or not isinstance(tag_map, dict):
+                continue
+            item: Dict[str, List[str]] = {}
+            for dim, values in tag_map.items():
+                if not dim or not values:
+                    continue
+                if isinstance(values, list):
+                    values = [str(value).strip() for value in values if str(value).strip()]
+                elif isinstance(values, str) and values.strip():
+                    values = [values.strip()]
+                else:
+                    values = []
+                if values:
+                    item[str(dim).strip()] = values
+            cleaned[doc_id] = item
+        return cleaned
+
+    def validate_dimension_schema_batch(
+        self,
+        records: List[Dict[str, str]],
+        dims: List[str],
+        max_text_chars: int = 4000,
+    ) -> Dict[str, Dict[str, List[str]]]:
+        """批量验证候选维度 schema，不执行标签写入。
+
+        返回 ``chunk_id -> {dimension_name: [explicit values]}``，仅供维度
+        覆盖率、取值多样性和冗余诊断使用。该接口与正式标签生成接口分开，
+        调用方不会把结果写入 Qdrant/MySQL。
+        """
+        if not records or not dims:
+            return {}
+
+        records_block = []
+        for record in records:
+            doc_id = str(record.get("doc_id", ""))
+            text = _clip_text(str(record.get("doc_text", "")), max_text_chars)
+            records_block.append(f"ID: {doc_id}\n文本：\n---\n{text}\n---")
+
+        prompt = PROMPT_VALIDATE_SCHEMA_BATCH.format(
+            dims_list="、".join(dims),
+            records_block="\n\n".join(records_block),
+        )
+
+        try:
+            result = self._call_llm_json(prompt, temperature=0.1)
+        except Exception as exc:
+            print(f"[Warning] schema 批量验证失败: {exc}")
+            return {}
+
+        valid_ids = {str(record.get("doc_id", "")) for record in records}
+        allowed_dims = {str(dim).strip() for dim in dims if str(dim).strip()}
+        raw_records = result.get("records", []) if isinstance(result, dict) else []
+        if not isinstance(raw_records, list):
+            raw_records = []
+
+        cleaned: Dict[str, Dict[str, List[str]]] = {}
+        for item in raw_records:
+            if not isinstance(item, dict):
+                continue
+            doc_id = str(item.get("id", item.get("doc_id", ""))).strip()
+            dimension_map = item.get("dimensions", {})
+            if doc_id not in valid_ids or not isinstance(dimension_map, dict):
+                continue
+
+            cleaned_dims: Dict[str, List[str]] = {}
+            for dim, values in dimension_map.items():
+                dim = str(dim).strip()
+                if dim not in allowed_dims:
+                    continue
+                if isinstance(values, str):
+                    values = [values]
+                if not isinstance(values, list):
+                    continue
+                values = list(dict.fromkeys(
+                    str(value).strip() for value in values
+                    if str(value).strip() and str(value).upper() not in {"NULL", "NONE", "无", "未提及"}
+                ))
+                if values:
+                    cleaned_dims[dim] = values
+            if cleaned_dims:
+                cleaned[doc_id] = cleaned_dims
+        return cleaned
 
     def _extract_batch_fallback(
         self,

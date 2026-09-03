@@ -37,7 +37,24 @@ code1_lyj/models/
 
 # Local datasets, embeddings, vector stores, and generated experiment data
 data_input/
+results/
 experiment_data/
+chunk_code/.git/
+chunk_code/**/.git/
+chunk_code/.specstory/
+chunk_code/.vscode/
+chunk_code/__pycache__/
+chunk_code/data/
+chunk_code/results/
+chunk_code/output_*/
+chunk_code/crud_data/
+chunk_code/meta-chunking-env/
+chunk_code/**/.cache/
+chunk_code/**/*.log
+chunk_code/**/*.jsonl
+chunk_code/**/*.pyc
+chunk_code/**/quest_eval/*_save.json
+chunk_code/**/CRUD/crud.json
 experiment_results/
 fusion_results/
 output_chunks/

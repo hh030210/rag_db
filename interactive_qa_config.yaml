@@ -24,6 +24,7 @@ qa:
   enable: true        # 是否开启 LLM 问答生成
   temperature: 0.1    # LLM 温度
   max_tokens: 512     # LLM 最大 Token 数
+  context_chars: 0    # 每个检索 chunk 传给模型的字符数；0 表示使用完整 chunk
 
 # ---- 展示配置 ----
 display:

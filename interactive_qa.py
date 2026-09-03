@@ -27,9 +27,10 @@
 import sys
 import os
 import io
+import re
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -79,6 +80,10 @@ LLM_SYSTEM_PROMPT = """你是景点知识问答助手。回答问题严格满足
 # ==================== LLM 配置（由配置文件生成）====================
 DS_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")                  # DashScope API Key
 DS_MODEL = "qwen-plus"                  # DashScope 模型
+QA_OPENAI_COMPAT = os.getenv("LLM_OPENAI_COMPAT", "0").lower() in {"1", "true", "yes"}
+QA_API_KEY = os.getenv("LLM_API_KEY", "")
+QA_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1")
+QA_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-8B")
 DS_MAX_RETRIES = 3
 DS_RETRY_SLEEP = 5
 DS_MIN_INTERVAL = 0.1
@@ -94,6 +99,9 @@ RERANK_MODE = "score"            # score | interleaved
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 512
 ENABLE_QA = True
+# 问答生成默认使用完整 chunk。只有调用方显式传入大于 0 的值时才限长。
+# 这与 DISPLAY_CHARS 分离：DISPLAY_CHARS 只控制终端展示，不控制模型可见内容。
+DEFAULT_QA_CONTEXT_CHARS = 0
 DISPLAY_CHARS = 300
 VERBOSE = False
 
@@ -327,6 +335,7 @@ def compute_adaptive_weights(
     constraints: dict,
     dim_top_k: int = 5,
     sem_top_k: int = 5,
+    query_analysis: Optional[dict] = None,
 ) -> tuple[float, float]:
     """
     根据 semantic_dimension_fusion_strategy.md 3.2 节的自适应权重方案，
@@ -338,6 +347,15 @@ def compute_adaptive_weights(
 
     # Step 1: 结构化置信度 P_q
     P_q = _compute_structural_confidence(constraints)
+
+    analysis = query_analysis or {}
+    active_dimensions = analysis.get("active_dimensions") or [
+        key for key in constraints if not str(key).startswith("_")
+    ]
+    # 没有独立维度分析证据时，维度分支最多只能作为很小的补充，
+    # 不能因候选列表集中而反向放大错误标签。
+    if not active_dimensions or not dim_results:
+        P_q = 0.0
 
     # Step 2: 标签证据置信度 T_q
     T_q = _compute_label_evidence_confidence(constraints, dim_results)
@@ -357,12 +375,26 @@ def compute_adaptive_weights(
     alpha_dim = U_dim / (U_dim + U_sem + eps)
     alpha_sem = 1.0 - alpha_dim
 
+    if not active_dimensions or not dim_results:
+        alpha_dim = min(alpha_dim, 0.15)
+        alpha_sem = 1.0 - alpha_dim
+    elif analysis.get("confidence", 0.0) < 0.35:
+        alpha_dim = min(alpha_dim, 0.30)
+        alpha_sem = 1.0 - alpha_dim
+
     return alpha_dim, alpha_sem
 
 
 # ==================== 重排函数 ====================
 
-def rerank_by_score(dim_results: list, sem_results: list, dim_alpha: float, sem_alpha: float, top_k: int) -> list:
+def rerank_by_score(
+    dim_results: list,
+    sem_results: list,
+    dim_alpha: float,
+    sem_alpha: float,
+    top_k: int,
+    query_analysis: Optional[dict] = None,
+) -> list:
     """
     方案一：得分重排
     - 将 dim 和 sem 结果的排名映射为得分（排名越靠前得分越高）
@@ -371,29 +403,62 @@ def rerank_by_score(dim_results: list, sem_results: list, dim_alpha: float, sem_
     if not dim_results and not sem_results:
         return []
 
+    query_analysis = query_analysis or {}
+    active_dimensions = set(query_analysis.get("active_dimensions") or [])
+
+    def _rank_score(index: int, size: int) -> float:
+        """把不同长度的两路排名分别归一化到 [0,1]，避免 dim=100 压过 sem=20。"""
+        if size <= 1:
+            return 1.0
+        return max(0.0, 1.0 - index / (size - 1))
+
     dim_rank_map = {}
     for i, r in enumerate(dim_results):
         cid = r.get("chunk_id")
         if cid:
-            dim_rank_map[cid] = len(dim_results) - i
+            dim_rank_map[cid] = _rank_score(i, len(dim_results))
 
     sem_rank_map = {}
     for i, r in enumerate(sem_results):
         cid = r.get("chunk_id")
         if cid:
-            sem_rank_map[cid] = len(sem_results) - i
+            sem_rank_map[cid] = _rank_score(i, len(sem_results))
 
     all_chunks = {}
     for r in dim_results + sem_results:
         cid = r.get("chunk_id")
-        if cid and cid not in all_chunks:
+        if not cid:
+            continue
+        if cid not in all_chunks:
             all_chunks[cid] = r.copy()
-            all_chunks[cid]["dim_score"] = dim_rank_map.get(cid, 0)
-            all_chunks[cid]["sem_score"] = sem_rank_map.get(cid, 0)
-            dim_s = dim_rank_map.get(cid, 0)
-            sem_s = sem_rank_map.get(cid, 0)
-            all_chunks[cid]["final_score"] = dim_alpha * dim_s + sem_alpha * sem_s
-            all_chunks[cid]["source"] = ("dim" if dim_s > 0 else "") + ("+sem" if sem_s > 0 else "")
+        else:
+            # 维度结果包含更完整的匹配证据，语义结果补充缺失字段。
+            for key, value in r.items():
+                if value not in (None, "", [], {}):
+                    all_chunks[cid].setdefault(key, value)
+
+    for cid, item in all_chunks.items():
+        dim_s = dim_rank_map.get(cid, 0.0)
+        sem_s = sem_rank_map.get(cid, 0.0)
+        matched_dimensions = set(item.get("matched_dimensions") or [])
+        if not matched_dimensions:
+            matched_dimensions = {
+                hit.get("dim") for hit in item.get("tag_hits", []) if hit.get("dim")
+            }
+        coverage = (
+            len(matched_dimensions & active_dimensions) / len(active_dimensions)
+            if active_dimensions else 0.0
+        )
+        entity_score = float(item.get("entity_score") or 0.0)
+        # 维度证据为特征加分，不替代两路主分，避免少量标签吞掉语义结果。
+        feature_bonus = 0.12 * entity_score + 0.08 * coverage
+        item["dim_score"] = dim_s
+        item["sem_score"] = sem_s
+        item["dimension_coverage"] = coverage
+        item["entity_score"] = entity_score
+        item["matched_dimensions"] = sorted(matched_dimensions)
+        item["final_score"] = dim_alpha * dim_s + sem_alpha * sem_s + feature_bonus
+        item["source"] = ("dim" if dim_s > 0 else "") + ("+sem" if sem_s > 0 else "")
 
     scored = list(all_chunks.values())
     scored.sort(key=lambda x: x["final_score"], reverse=True)
@@ -497,12 +562,14 @@ def do_search(query: str, mode: str, top_k: int, dim_alpha: float, sem_alpha: fl
     sem_raw = {}
     fusion_raw = []
     constraints = {}
+    query_analysis = {}
     error = ""
 
     # ---- 语义检索 ----
     try:
         sem_raw = sem_searcher.search(query, top_k=SearchConfig.SEM_TOP_K)
         sem_results = sem_raw.get("results", [])
+        query_analysis = sem_raw.get("query_analysis", {}) or {}
     except Exception as e:
         sem_results = []
         error += f"[语义检索] {e}  "
@@ -510,9 +577,17 @@ def do_search(query: str, mode: str, top_k: int, dim_alpha: float, sem_alpha: fl
     # ---- 维度检索 ----
     if mode in ("fusion", "dim") and dim_searcher is not None:
         try:
-            dim_raw = dim_searcher.search(query, top_k=SearchConfig.DIM_TOP_K, alpha=dim_alpha)
+            # 维度检索必须是纯 dim 分支；外层在这里统一做归一化融合。
+            # 若省略 fusion，检索器内部会再次把 dim 与 sem 融合，造成双重融合和排名污染。
+            dim_raw = dim_searcher.search(
+                query,
+                top_k=SearchConfig.DIM_TOP_K,
+                alpha=dim_alpha,
+                fusion="dim_only",
+            )
             constraints = dim_raw.get("constraints", {})
-            dim_results = dim_raw.get("results", [])
+            query_analysis = dim_raw.get("query_analysis", {}) or query_analysis
+            dim_results = dim_raw.get("dim_results", dim_raw.get("results", []))
         except Exception as e:
             dim_results = []
             error += f"[维度检索] {e}  "
@@ -533,6 +608,7 @@ def do_search(query: str, mode: str, top_k: int, dim_alpha: float, sem_alpha: fl
                     constraints,
                     dim_top_k=5,
                     sem_top_k=5,
+                    query_analysis=query_analysis,
                 )
                 effective_dim_alpha = ad_dim
                 effective_sem_alpha = ad_sem
@@ -548,18 +624,19 @@ def do_search(query: str, mode: str, top_k: int, dim_alpha: float, sem_alpha: fl
             # 根据 rerank_mode 选择重排方式
             if rerank_mode == "interleaved":
                 fusion_raw = rerank_by_interleaved(
-                    dim_raw.get("results", []),
+                    dim_results,
                     sem_results,
                     top_k=top_k,
                 )
             else:
                 # 方案一：得分重排（默认）
                 fusion_raw = rerank_by_score(
-                    dim_raw.get("results", []),
+                    dim_results,
                     sem_results,
                     dim_alpha=effective_dim_alpha,
                     sem_alpha=effective_sem_alpha,
                     top_k=top_k,
+                    query_analysis=query_analysis,
                 )
         except Exception as e:
             error += f"[融合] {e}  "
@@ -591,6 +668,7 @@ def do_search(query: str, mode: str, top_k: int, dim_alpha: float, sem_alpha: fl
         "top_chunks": top_chunks,
         "display_results": display_results,
         "constraints": constraints,
+        "query_analysis": query_analysis,
         "error": error.strip(),
         "adaptive_dim_alpha": effective_dim_alpha,
         "adaptive_sem_alpha": effective_sem_alpha,
@@ -667,6 +745,17 @@ def print_search_results(result: dict, display_chars: int, verbose: bool):
         else:
             print(f"  [固定融合] alpha_dim={ad_dim:.4f}  alpha_sem={ad_sem:.4f}")
 
+    if verbose:
+        analysis = result.get("query_analysis") or {}
+        if analysis:
+            print(
+                "  [查询分析] "
+                f"景区={analysis.get('spot_names') or '未识别'}  "
+                f"实体={analysis.get('entity_terms') or '未识别'}  "
+                f"相关维度={analysis.get('active_dimensions') or '无'}  "
+                f"置信度={analysis.get('confidence', 0.0):.3f}"
+            )
+
     # ---- fusion 模式：三路各展示 Top-5 ----
     if mode == "fusion":
         print(_fmt_section_header(f"语义检索 Top-5（共 {len(sem_results)} 条）"))
@@ -677,6 +766,13 @@ def print_search_results(result: dict, display_chars: int, verbose: bool):
                     ev = r.get("evidence", [])
                     if ev:
                         print(f"    [证据]   " + " | ".join(ev[:3]))
+                    if r.get("match_source") or r.get("dimension_coverage") is not None:
+                        print(
+                            "    [维度证据] "
+                            f"source={r.get('match_source', '')}  "
+                            f"coverage={r.get('dimension_coverage', 0.0):.3f}  "
+                            f"entity={r.get('entity_score', 0.0):.3f}"
+                        )
         else:
             print("  （无结果）")
 
@@ -687,14 +783,24 @@ def print_search_results(result: dict, display_chars: int, verbose: bool):
                 if constraints:
                     dim_parts = []
                     for dim, vals in constraints.items():
+                        if str(dim).startswith("_"):
+                            continue
                         dim_parts.append(f"    {dim}: {vals}")
-                    print(f"  维度约束:\n" + "\n".join(dim_parts))
+                    if dim_parts:
+                        print(f"  精确/别名维度值:\n" + "\n".join(dim_parts))
             for i, r in enumerate(dim_results[:5]):
                 print(_fmt_chunk(r, i, display_chars))
                 if verbose:
                     ev = r.get("evidence", [])
                     if ev:
                         print(f"    [证据]   " + " | ".join(ev[:3]))
+                    if r.get("match_source") or r.get("dimension_coverage") is not None:
+                        print(
+                            "    [维度证据] "
+                            f"source={r.get('match_source', '')}  "
+                            f"coverage={r.get('dimension_coverage', 0.0):.3f}  "
+                            f"entity={r.get('entity_score', 0.0):.3f}"
+                        )
         else:
             print("  （无结果）")
 
@@ -706,6 +812,13 @@ def print_search_results(result: dict, display_chars: int, verbose: bool):
                     ev = r.get("evidence", [])
                     if ev:
                         print(f"    [证据]   " + " | ".join(ev[:3]))
+                    if r.get("match_source") or r.get("dimension_coverage") is not None:
+                        print(
+                            "    [维度证据] "
+                            f"source={r.get('match_source', '')}  "
+                            f"coverage={r.get('dimension_coverage', 0.0):.3f}  "
+                            f"entity={r.get('entity_score', 0.0):.3f}"
+                        )
         else:
             print("  （无融合结果，降级显示语义 Top-5）")
             for i, r in enumerate(sem_results[:5]):
@@ -730,8 +843,11 @@ def print_search_results(result: dict, display_chars: int, verbose: bool):
         if constraints:
             dim_parts = []
             for dim, vals in constraints.items():
+                if str(dim).startswith("_"):
+                    continue
                 dim_parts.append(f"    {dim}: {vals}")
-            print(f"  维度约束:\n" + "\n".join(dim_parts))
+            if dim_parts:
+                print(f"  精确/别名维度值:\n" + "\n".join(dim_parts))
 
     for i, r in enumerate(display):
         print(_fmt_chunk(r, i, display_chars))
@@ -746,6 +862,24 @@ def print_search_results(result: dict, display_chars: int, verbose: bool):
 # ==================== LLM 调用 ====================
 
 def call_dashscope(messages, temperature=0.1, max_tokens=512):
+    # 支持 SiliconFlow/OpenAI 兼容接口；用于服务器没有 DashScope Key、
+    # 但已配置 LLM_API_KEY + LLM_BASE_URL 的实验环境。
+    if QA_OPENAI_COMPAT or (not DS_API_KEY and QA_API_KEY):
+        from openai import OpenAI
+
+        _DS_RATE_LIMITER.wait()
+        client = OpenAI(api_key=QA_API_KEY, base_url=QA_BASE_URL)
+        kwargs = {
+            "model": QA_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if "qwen3" in QA_MODEL.lower():
+            kwargs["extra_body"] = {"enable_thinking": False}
+        response = client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content or ""
+
     import dashscope
     from dashscope import Generation
     from concurrent.futures import ThreadPoolExecutor
@@ -851,8 +985,83 @@ def _fuse_answers(question: str, answers: list, prompt_infos: list) -> str:
         return answers[0]
 
 
+def _context_terms(query: str) -> list[str]:
+    """提取用于显式限长时定位证据窗口的短语。"""
+    terms: list[str] = []
+    for part in re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9]+", str(query or "")):
+        terms.append(part)
+        # 中文查询通常没有空格，保留二字短语以及首尾短语，避免整句不连续时无法定位证据。
+        terms.extend(part[i:i + 2] for i in range(len(part) - 1))
+        if len(part) > 4:
+            terms.extend((part[:4], part[-4:]))
+    return list(dict.fromkeys(term for term in terms if len(term) >= 2))
+
+
+def _bound_context(text: str, query: str, limit: int) -> tuple[str, bool]:
+    """在显式设置上限时保留最相关窗口；默认路径不调用此函数。"""
+    text = str(text or "")
+    if limit <= 0 or len(text) <= limit:
+        return text, False
+
+    terms = _context_terms(query)
+    positions: list[tuple[int, int]] = []
+    for term in terms:
+        start = text.find(term)
+        while start >= 0:
+            positions.append((start, len(term)))
+            start = text.find(term, start + 1)
+
+    if positions:
+        # 选择一个能覆盖最多查询短语、且总短语长度最大的窗口。
+        candidates = []
+        for position, _term_len in positions:
+            left = max(0, min(position - limit // 3, len(text) - limit))
+            right = left + limit
+            covered = [(term_len, start) for start, term_len in positions if left <= start < right]
+            score = (len(covered), sum(term_len for term_len, _start in covered), -left)
+            candidates.append((score, left, right))
+        _score, left, right = max(candidates)
+        bounded = text[left:right]
+        prefix = "…" if left > 0 else ""
+        suffix = "…" if right < len(text) else ""
+        return prefix + bounded + suffix, True
+
+    # 找不到查询短语时仍保留首尾，避免关键内容只位于文本中段时完全丢失。
+    head = max(1, limit // 2)
+    tail = max(1, limit - head)
+    return text[:head] + "…" + text[-tail:], True
+
+
+def _build_qa_context(query: str, chunks: list, context_chars: int) -> tuple[str, dict]:
+    """构造问答上下文，并记录模型实际看到的字符数用于审计。"""
+    context_parts = []
+    chunk_stats = []
+    for i, chunk in enumerate(chunks):
+        full_text = str(chunk.get("chunk_text_full") or chunk.get("chunk_text") or "")
+        text, truncated = _bound_context(full_text, query, context_chars)
+        title = chunk.get("chunk_gen_title") or chunk.get("doc_title", "")
+        cid = chunk.get("chunk_id", "")
+        context_parts.append(f"[来源 {i+1}] {title} ({cid}):\n{text}")
+        chunk_stats.append(
+            {
+                "chunk_id": str(cid),
+                "source_chars": len(full_text),
+                "provided_chars": len(text),
+                "truncated": truncated,
+            }
+        )
+    return "\n\n".join(context_parts), {
+        "mode": "full" if context_chars <= 0 else "bounded",
+        "requested_chars_per_chunk": context_chars,
+        "chunks": chunk_stats,
+        "source_chars": sum(item["source_chars"] for item in chunk_stats),
+        "provided_chars": sum(item["provided_chars"] for item in chunk_stats),
+        "truncated_chunks": sum(item["truncated"] for item in chunk_stats),
+    }
+
+
 def do_qa(query: str, chunks: list, top_k: int, temperature: float, max_tokens: int,
-          expand_result: dict = None):
+          expand_result: dict = None, context_chars: int = DEFAULT_QA_CONTEXT_CHARS):
     """调用 LLM 生成答案，支持多 Prompt 融合（/expand 开启时）。
 
     策略（借鉴 code1 Tourist_step5_inference_multithread_v9.py）：
@@ -863,16 +1072,18 @@ def do_qa(query: str, chunks: list, top_k: int, temperature: float, max_tokens: 
     t0 = time.time()
     if not chunks:
         print("  [跳过] 无检索结果")
-        return
+        return {
+            "answer": "",
+            "elapsed": 0.0,
+            "prompt_count": 0,
+            "successful_prompt_count": 0,
+            "generation_errors": [],
+            "error": "no_retrieval_context",
+        }
 
-    context_parts = []
-    for i, chunk in enumerate(chunks):
-        text = chunk.get("chunk_text_full") or chunk.get("chunk_text") or ""
-        title = chunk.get("chunk_gen_title") or chunk.get("doc_title", "")
-        cid = chunk.get("chunk_id", "")
-        context_parts.append(f"[来源 {i+1}] {title} ({cid}):\n{text[:500]}")
+    generation_errors = []
 
-    context = "\n\n".join(context_parts)
+    context, context_stats = _build_qa_context(query, chunks, context_chars)
 
     # ── 收集可用的 PromptModule（Top-2） ──
     top_prompts: list = (expand_result or {}).get("top_prompts", [])
@@ -902,6 +1113,7 @@ def do_qa(query: str, chunks: list, top_k: int, temperature: float, max_tokens: 
                 answers.append(ans)
                 prompt_results.append(usable_info[i])
             except Exception as e:
+                generation_errors.append(str(e))
                 print(f"    [警告] Prompt {i+1} 生成失败: {e}")
 
         if len(answers) >= 2:
@@ -934,6 +1146,16 @@ def do_qa(query: str, chunks: list, top_k: int, temperature: float, max_tokens: 
     print(f"  ── LLM 回答 ──")
     print(f"  {final_answer}")
     print()
+
+    return {
+        "answer": (final_answer or "").strip(),
+        "elapsed": elapsed,
+        "prompt_count": len(usable_prompts),
+        "successful_prompt_count": len(answers) if len(usable_prompts) >= 2 else (1 if final_answer else 0),
+        "generation_errors": generation_errors,
+        "error": "",
+        "context_stats": context_stats,
+    }
 
 
 
