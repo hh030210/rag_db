@@ -1230,3 +1230,10 @@ python integrated_chunker.py --input data/db_qa.txt --line_mode --output output_
 - 外层问答流程现在显式调用纯 `dim_only`，只在外层做一次融合；两路排名分别归一化到 `[0,1]` 后按自适应权重相加，并加入覆盖率/实体一致性特征，修复原先维度分支内部先融合、外层再次融合以及 `dim=100` 与 `sem=20` 排名尺度不一致的问题。
 - `badcase_eval.py` 会保存查询分析和新的维度匹配审计字段，便于区分“景区识别错误、维度激活错误、标签匹配失败、语义召回失败”和生成错误。
 - 本地验证已通过：`python3 -m py_compile retrieval_fusion_eval.py interactive_qa.py badcase_eval.py`、`git diff --check`；离线回归覆盖景区硬过滤、精确匹配优先、向量 threshold + margin，以及两路不同候选长度的归一化融合。当前只完成本地代码修改，尚未部署服务器、尚未重跑问答或声明指标提升；下一步应在服务器用同一批 QA 数据对比旧版和新版的 Hit@K、MRR、景区误召回率、维度覆盖率和最终 badcase。
+
+### 2026-09-03 — master 分支代码同步记录
+
+- 已将本地最新源码、`chunk_code/` 分片项目、问答评测脚本、Qdrant 部署脚本、实验说明和 badcase 分析文档整理到 `master` 分支。
+- 本次明确保留的核心修改包括：完整 chunk 上下文问答输入、查询分析与景区/实体识别、相关维度选择、景区硬过滤、同维度精确/别名优先、向量匹配 threshold + margin、覆盖率/实体一致性重排、归一化融合，以及自动 badcase 统计与审计字段。
+- 上传前保留了数据集、实验结果、日志、模型文件、向量库、本地缓存和凭据排除规则；API Key、服务器密码等运行参数继续通过环境变量或本地配置注入。
+- 远程仓库原有上传历史已合并保留；本次提交后续将推送到 `https://github.com/hh030210/rag_db.git` 的 `master` 分支。
